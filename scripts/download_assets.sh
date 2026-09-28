@@ -6,7 +6,7 @@
 #
 # Usage:
 #   bash scripts/download_assets.sh            # models + small/medium datasets
-#   WITH_PUBMED=1 bash scripts/download_assets.sh   # also the MedRAG PubMed corpus (large)
+#   WITH_WIKIPEDIA=1 WITH_PUBMED=1 bash scripts/download_assets.sh   # + large MedRAG corpora
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,12 +27,9 @@ fetch model Qwen/Qwen3-8B              "${ROOT}/weights/Qwen3-8B"        # reali
 fetch model Qwen/Qwen3-VL-4B-Instruct  "${ROOT}/weights/Qwen3-VL-4B-Instruct"  # P3 multimodal target
 
 # --- RAG corpora + evaluation -----------------------------------------------
+# MedRAG/statpearls on the Hub is README-only (license): build it from the NCBI
+# Bookshelf dump with MedRAG's script when needed. Large corpora are at the end.
 fetch dataset MedRAG/textbooks         "${ROOT}/data/medrag/textbooks"
-fetch dataset MedRAG/statpearls        "${ROOT}/data/medrag/statpearls"
-fetch dataset MedRAG/wikipedia         "${ROOT}/data/medrag/wikipedia"
-if [[ "${WITH_PUBMED:-0}" == "1" ]]; then
-  fetch dataset MedRAG/pubmed          "${ROOT}/data/medrag/pubmed"
-fi
 mkdir -p "${ROOT}/data/mirage"
 echo ">>> MIRAGE benchmark.json"
 curl -fL -o "${ROOT}/data/mirage/benchmark.json" \
@@ -51,6 +48,14 @@ fetch dataset flaviagiammarino/path-vqa     "${ROOT}/data/path-vqa"
 # --- Serving benchmark workload ----------------------------------------------
 fetch dataset anon8231489123/ShareGPT_Vicuna_unfiltered "${ROOT}/data/sharegpt" \
   --include "ShareGPT_V3_unfiltered_cleaned_split.json"
+
+# --- Large optional RAG corpora (opt-in) ---------------------------------------
+if [[ "${WITH_WIKIPEDIA:-0}" == "1" ]]; then   # ~46 GB
+  fetch dataset MedRAG/wikipedia       "${ROOT}/data/medrag/wikipedia"
+fi
+if [[ "${WITH_PUBMED:-0}" == "1" ]]; then      # ~70 GB
+  fetch dataset MedRAG/pubmed          "${ROOT}/data/medrag/pubmed"
+fi
 
 echo
 if ((${#FAILED[@]})); then
