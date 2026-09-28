@@ -78,6 +78,22 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def abort(self, seq: Sequence):
+        """Drop an unfinished sequence (e.g. client disconnected) and free its KV blocks.
+
+        Must be called between steps, never while a scheduled batch is in flight.
+        """
+        if seq.is_finished:
+            return
+        if seq.status == SequenceStatus.WAITING:
+            # a partially chunk-prefilled seq is still WAITING but already owns blocks
+            self.waiting.remove(seq)
+        else:
+            self.running.remove(seq)
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        seq.status = SequenceStatus.FINISHED
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)

@@ -45,13 +45,28 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
-    def step(self):
+    def step_updates(self) -> tuple[list[Sequence], int]:
+        """Run one engine step.
+
+        Returns:
+            The sequences that sampled a new token in this step (partially
+            chunk-prefilled sequences are excluded), and the number of tokens
+            processed (positive for a prefill step, negative for decode).
+        """
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # mirrors Scheduler.postprocess: a prefill emits a token only once the whole prompt is cached
+        emitted = [seq for seq in seqs
+                   if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens >= seq.num_tokens]
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        return emitted, num_tokens
+
+    def step(self):
+        emitted, num_tokens = self.step_updates()
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in emitted if seq.is_finished]
         return outputs, num_tokens
 
     def is_finished(self):
