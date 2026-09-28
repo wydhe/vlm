@@ -54,9 +54,25 @@ Qwen3-0.6B，64 条 ShareGPT 提示词（≤1500 token），贪心生成 64 toke
    （decode 优先占用预算，新请求排队更久）。这是 stall-free 调度的固有权衡。
 3. **token 预算在 512~16384 之间对 ITL 影响很小**（ITL P99 53~59 ms）：ShareGPT 提示词多数很短，
    大 prefill 块本就少见。ITL P90 仍约 48 ms、是 vLLM 的 2 倍多。
-   **待验证假设**：混合步走 eager（无 CUDA Graph），只要一步里混入任意 prefill，
-   该步所有 decode 都失去 CUDA Graph 加速（离线实测 8B 上 Graph 带来 1.28×），再叠加每步 CPU 开销。
-   下一步用单步计时区分"混合步 eager 惩罚"与"CPU 开销"，再决定先做 piecewise CUDA Graph 还是 overlap 调度。
+   原因见下方"瓶颈定位"：混合步的 eager 执行有约 29 ms 的固定 CPU 开销。
+
+## 瓶颈定位：混合步 eager 执行的 kernel launch 开销
+
+`uv run python -m bench.step_cost --model weights/Qwen3-8B`（稳态 decode 中每步加入一条随机 token 新请求，单步中位数）：
+
+| decode bs | 纯 decode（CUDA Graph） | +1 token prefill | +32 | +256 | +1024 |
+|---|---|---|---|---|---|
+| 32 | 12.9 ms | 42.1 ms | 40.2 ms | 40.6 ms | 78.3 ms |
+| 128 | 18.0 ms | 43.1 ms | 41.2 ms | 42.4 ms | 92.3 ms |
+| 224 | 27.4 ms | 44.0 ms | 48.0 ms | 64.3 ms | 113.9 ms |
+
+- 只混入 **1 个** prefill token，单步就从 12.9 ms 变成 42 ms；并且这个约 40 ms 的"地板"几乎不随 bs、prefill 长度（≤256）变化 → 固定开销，而非计算量。
+- torch.profiler（bs=32）：纯 decode 步 GPU kernel 总时长 **12.6 ms**，混合（+1）步 **12.9 ms**——GPU 工作量几乎相同，
+  多出的约 29 ms 全部是 host 侧：eager 模式下 Python 逐层发起约 600 个 kernel，GPU 在等 CPU。
+- 这解释了 ITL P90 ≈ 48 ms 且对 token 预算不敏感：在线负载下大部分步都会混入新请求的 prefill。
+
+**下一步（P2.5）**：移植 vLLM V1 的 piecewise CUDA Graph——按 token 数分桶捕获"除 attention 以外"的计算图，
+attention（varlen + 分页 KV）在图间 eager 执行。预期混合步回落到接近 GPU 实际耗时，届时再做 overlap 调度隐藏剩余 CPU 开销。
 
 ## 局限
 
