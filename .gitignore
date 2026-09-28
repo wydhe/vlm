@@ -1,0 +1,47 @@
+# === Claude CLI & 凭证 ===
+.env
+*.env
+.claude/
+CLAUDE_LOGS/
+
+# === Python & 编译缓存 ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# === 虚拟环境 ===
+venv/
+.venv/
+env/
+
+# === 模型权重与检查点 (千万不要进 Git) ===
+checkpoints/
+weights/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+
+# === 视觉与多模态数据集 / 预处理缓存 ===
+data/
+datasets/
+*.tar
+*.tar.gz
+*.zip
+*.h5
+*.hdf5
+
+# === 日志、可视化与推理输出 ===
+runs/
+logs/
+wandb/
+tensorboard/
+results/
+outputs/
+.cache/
