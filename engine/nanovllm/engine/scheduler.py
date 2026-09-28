@@ -12,6 +12,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.policy = getattr(config, "scheduling_policy", "mixed")
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -23,6 +24,65 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """Pick the next batch. Returns (seqs, is_prefill); is_prefill means "run the varlen path"."""
+        if self.policy == "mixed":
+            return self._schedule_mixed()
+        return self._schedule_prefill_first()
+
+    def _schedule_mixed(self) -> tuple[list[Sequence], bool]:
+        """Stall-free batching under one token budget (vLLM V1 / Sarathi-Serve style).
+
+        1. Every running sequence gets its 1 decode token first, so an arriving
+           prompt never pauses ongoing generations.
+        2. The remaining budget prefills waiting sequences, chunking the last one.
+        Decode tokens ride in the same varlen forward as a q_len=1 "chunk".
+        """
+        scheduled_seqs = []
+        budget = self.max_num_batched_tokens
+
+        # 1. decode: running sequences (preempting from the tail when out of blocks)
+        num_running = len(self.running)
+        for _ in range(num_running):
+            if not self.running or len(scheduled_seqs) >= self.max_num_seqs or budget == 0:
+                break
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+                budget -= 1
+        num_decode = len(scheduled_seqs)
+        # decoded seqs go back in their original order, ahead of the ones not scheduled this step
+        self.running.extendleft(reversed(scheduled_seqs))
+
+        # 2. prefill: waiting sequences (including a partially prefilled head) with what is left
+        while self.waiting and budget > 0 and len(scheduled_seqs) < self.max_num_seqs:
+            seq = self.waiting[0]
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break
+                self.block_manager.allocate(seq, num_cached_blocks)
+            seq.num_scheduled_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget)
+            budget -= seq.num_scheduled_tokens
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
+            scheduled_seqs.append(seq)
+
+        assert scheduled_seqs or not self.running, "running sequences but nothing scheduled"
+        return scheduled_seqs, len(scheduled_seqs) > num_decode
+
+    def _schedule_prefill_first(self) -> tuple[list[Sequence], bool]:
+        """Upstream nano-vllm policy: a step is either all-prefill or all-decode."""
         scheduled_seqs = []
         num_batched_tokens = 0
 

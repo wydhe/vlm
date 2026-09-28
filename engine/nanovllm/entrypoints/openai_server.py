@@ -4,7 +4,7 @@ Usage:
     python -m nanovllm.entrypoints.openai_server --model weights/Qwen3-8B --port 8000
 
 Supported request fields: ``prompt`` (str or token ids, single prompt) / ``messages``,
-``max_tokens``, ``temperature`` (0 is approximated by 1e-5), ``stream``,
+``max_tokens``, ``temperature`` (0 = greedy), ``stream``,
 ``stream_options.include_usage``, ``ignore_eos`` and, for chat,
 ``chat_template_kwargs`` (e.g. ``{"enable_thinking": false}`` for Qwen3).
 """
@@ -26,7 +26,6 @@ from nanovllm.engine.async_engine import AsyncLLMEngine, EngineDeadError, Reques
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.detokenizer import IncrementalDetokenizer
 
-MIN_TEMPERATURE = 1e-5  # the sampler rejects 0; this is effectively greedy
 
 
 class StreamOptions(BaseModel):
@@ -42,8 +41,8 @@ class _SamplingFields(BaseModel):
     ignore_eos: bool = False
 
     def sampling_params(self) -> SamplingParams:
-        return SamplingParams(temperature=max(self.temperature, MIN_TEMPERATURE),
-                              max_tokens=self.max_tokens, ignore_eos=self.ignore_eos)
+        return SamplingParams(temperature=self.temperature, max_tokens=self.max_tokens,
+                              ignore_eos=self.ignore_eos)
 
 
 class CompletionRequest(_SamplingFields):
@@ -177,6 +176,7 @@ def main() -> None:
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--scheduling-policy", choices=["mixed", "prefill_first"], default="mixed")
     args = p.parse_args()
     if not args.model:
         p.error("pass --model or set MODEL_DIR")
@@ -185,7 +185,8 @@ def main() -> None:
                             max_num_seqs=args.max_num_seqs,
                             max_num_batched_tokens=args.max_num_batched_tokens,
                             gpu_memory_utilization=args.gpu_memory_utilization,
-                            enforce_eager=args.enforce_eager)
+                            enforce_eager=args.enforce_eager,
+                            scheduling_policy=args.scheduling_policy)
     name = args.served_model_name or os.path.basename(os.path.normpath(args.model))
     uvicorn.run(build_app(engine, name), host=args.host, port=args.port, log_level="warning")
 

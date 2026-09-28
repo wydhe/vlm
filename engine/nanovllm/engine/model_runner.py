@@ -140,7 +140,8 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            # a decode seq in a mixed batch is a q_len=1 chunk; on TP workers it only carries last_token
+            input_ids.extend(seq[start:end] if seq.is_prefill else [seq.last_token])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
