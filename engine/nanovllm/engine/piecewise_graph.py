@@ -18,6 +18,8 @@ LM head. All pieces of all buckets share one set of max-size static buffers
 (views ``[:T]``), so temporaries live in one graph memory pool.
 """
 
+import gc
+
 import torch
 from torch import nn
 
@@ -107,19 +109,30 @@ class PiecewiseCudaGraphRunner:
 
     @torch.inference_mode()
     def capture(self) -> None:
-        """Capture every bucket, largest first so the shared pool is sized once."""
+        """Capture every bucket, largest first so the shared pool is sized once.
+
+        Uses ``capture_begin``/``capture_end`` directly: the ``torch.cuda.graph`` context
+        runs ``gc.collect()`` + ``empty_cache()`` on every entry, which dominated startup
+        (hundreds of graphs) when the process holds a large Python heap.
+        """
         num_pieces = len(self.layers) + 1
+        stream = torch.cuda.Stream()
+        gc.collect()
+        torch.cuda.empty_cache()
         for t in reversed(self.sizes):
             for p in range(num_pieces):          # warmup: trigger torch.compile outside capture
                 self._piece(p, t)
+            torch.cuda.synchronize()
             graphs = []
-            for p in range(num_pieces):
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, self.pool):
+            with torch.cuda.stream(stream):
+                for p in range(num_pieces):
+                    g = torch.cuda.CUDAGraph()
+                    g.capture_begin(pool=self.pool)
                     self._piece(p, t)
-                if self.pool is None:
-                    self.pool = g.pool()
-                graphs.append(g)
+                    g.capture_end()
+                    if self.pool is None:
+                        self.pool = g.pool()
+                    graphs.append(g)
             self.graphs[t] = graphs
             torch.cuda.synchronize()
 

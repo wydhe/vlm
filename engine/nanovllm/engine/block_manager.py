@@ -36,12 +36,24 @@ class BlockManager:
         self.num_cached_prompt_tokens = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1, extra: int = 0):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
+        if extra:
+            h.update(extra.to_bytes(8, "little"))
         return h.intdigest()
+
+    def _extra(self, seq: Sequence, i: int) -> int:
+        """Image content hash for blocks at/after the first image token.
+
+        Image placeholder tokens are identical for every image, so without this two
+        different images would hash to the same block and silently share KV.
+        """
+        if seq.mm is not None and (i + 1) * self.block_size > seq.mm.first_image_pos:
+            return seq.mm.image_hash
+        return 0
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
@@ -64,7 +76,7 @@ class BlockManager:
         num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._extra(seq, i))
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
@@ -80,7 +92,7 @@ class BlockManager:
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._extra(seq, i))
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
@@ -105,6 +117,18 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def reset_prefix_cache(self):
+        """Forget all cached prefixes, e.g. after the model weights were updated in place.
+
+        Cached KV was computed by the old weights; reusing it after an RL weight sync
+        would silently make rollouts off-policy. Only valid when no sequence holds blocks.
+        """
+        assert not self.used_block_ids, "reset_prefix_cache with live sequences"
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
@@ -120,6 +144,6 @@ class BlockManager:
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._extra(seq, i))
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id

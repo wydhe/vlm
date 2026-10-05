@@ -1,8 +1,24 @@
 from copy import copy
+from dataclasses import dataclass
 from enum import Enum, auto
+
+import torch
 from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
+
+
+@dataclass
+class MMData:
+    """Per-request multimodal state (Qwen3-VL), computed once when the request is added."""
+
+    embeds: torch.Tensor                # [n_image_tokens, hidden] vision features (GPU)
+    deepstack: list[torch.Tensor]       # per-LLM-layer features, same rows as ``embeds``
+    positions: torch.Tensor             # [3, prompt_len] (t, h, w) M-RoPE positions (CPU)
+    delta: int                          # later token i sits at position i + delta
+    image_hash: int                     # content hash, mixed into prefix-cache block hashes
+    first_image_pos: int                # index of the first image token
+    img_prefix: list[int]               # img_prefix[i] = #image tokens in token_ids[:i]
 
 
 class SequenceStatus(Enum):
@@ -29,6 +45,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.mm: MMData | None = None
 
     def __len__(self):
         return self.num_tokens
