@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.piecewise_graph import PiecewiseCudaGraphRunner
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_vl import Qwen3VLForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -30,7 +31,10 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        if config.mm_config is not None:
+            self.model = Qwen3VLForCausalLM(config.mm_config)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -140,6 +144,8 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        mrope = []                          # per-seq [3, n] M-RoPE positions (Qwen3-VL only)
+        mm_rows = []                        # (seq.mm, first_row, last_row) image-token feature rows
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -148,6 +154,13 @@ class ModelRunner:
             # a decode seq in a mixed batch is a q_len=1 chunk; on TP workers it only carries last_token
             input_ids.extend(seq[start:end] if seq.is_prefill else [seq.last_token])
             positions.extend(range(start, end))
+            if self.config.mm_config is not None:
+                mrope.append(self._mrope_chunk(seq, start, end))
+                if seq.mm is not None:
+                    p = seq.mm.img_prefix
+                    lo, hi = p[min(start, len(p) - 1)], p[min(end, len(p) - 1)]
+                    if hi > lo:
+                        mm_rows.append((seq.mm, lo, hi))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -168,12 +181,43 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if mrope:
+            pos3 = torch.cat(mrope, dim=1)
+            # text-only chunks have t == h == w: keep 1-D positions (graph-capturable)
+            positions = pos3[0] if torch.equal(pos3[0], pos3[1]) and torch.equal(pos3[0], pos3[2]) else pos3
+            positions = positions.pin_memory().cuda(non_blocking=True)
+        else:
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        mm_embeds = mm_deepstack = None
+        if mm_rows:
+            mm_embeds = torch.cat([mm.embeds[lo:hi] for mm, lo, hi in mm_rows]).cuda(non_blocking=True)
+            mm_deepstack = [torch.cat([mm.deepstack[k][lo:hi] for mm, lo, hi in mm_rows]).cuda(non_blocking=True)
+                            for k in range(len(mm_rows[0][0].deepstack))]
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    mm_embeds, mm_deepstack)
         return input_ids, positions
+
+    @staticmethod
+    def _mrope_chunk(seq: Sequence, start: int, end: int) -> torch.Tensor:
+        """[3, end - start] M-RoPE positions; tokens past the prompt sit at ``i + delta``."""
+        # explicit CPU: during init the default device is CUDA, and these get pinned + copied
+        if seq.mm is None:
+            return torch.arange(start, end, device="cpu").view(1, -1).expand(3, -1)
+        n_prompt = seq.mm.positions.size(1)
+        parts = []
+        if start < n_prompt:
+            parts.append(seq.mm.positions[:, start:min(end, n_prompt)])
+        if end > n_prompt:
+            parts.append(torch.arange(max(start, n_prompt), end, device="cpu").view(1, -1).expand(3, -1)
+                         + seq.mm.delta)
+        return torch.cat(parts, dim=1)
+
+    def encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+        """Vision tower forward for one request (Qwen3-VL); returns (embeds, deepstack)."""
+        return self.model.encode_images(pixel_values, grid_thw)
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -182,7 +226,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            positions.append(len(seq) - 1 + (seq.mm.delta if seq.mm is not None else 0))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -209,7 +253,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill and self.piecewise is not None and self.piecewise.can_run(input_ids.size(0)):
+        if (is_prefill and self.piecewise is not None and self.piecewise.can_run(input_ids.size(0))
+                and positions.dim() == 1 and get_context().mm_embeds is None):
             return self.model.compute_logits(self.piecewise.run(input_ids, positions))
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))

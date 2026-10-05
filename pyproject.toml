@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch==2.8.*",
+    "torchvision==0.23.*",
+    "pillow",
     "transformers>=4.57,<5",
     "flash-attn==2.8.3",
     "nano-vllm[serve]",
@@ -27,6 +29,7 @@ package = false
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
 nano-vllm = { path = "engine", editable = true }
 # Prebuilt wheel: avoids compiling flash-attn from source (torch 2.8 / CUDA 12 / cp312 / cxx11abi=TRUE).
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }

@@ -1,5 +1,7 @@
 import os
 from dataclasses import dataclass
+
+import torch
 from transformers import AutoConfig
 
 
@@ -19,6 +21,7 @@ class Config:
     scheduling_policy: str = "mixed"    # "mixed" (prefill chunks + decodes per step) | "prefill_first" (upstream)
     piecewise_cudagraph: bool = True    # CUDA graphs split at attention for mixed / prefill steps
     piecewise_max_tokens: int = 2048    # largest captured token bucket; bigger steps run eager
+    mm_config: AutoConfig | None = None  # full multimodal config (Qwen3-VL); hf_config is its text part
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -26,4 +29,10 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.hf_config.model_type == "qwen3_vl":
+            assert self.tensor_parallel_size == 1, "Qwen3-VL is single-GPU only"
+            self.mm_config = self.hf_config
+            self.hf_config = self.hf_config.text_config
+            if isinstance(self.hf_config.dtype, str):
+                self.hf_config.dtype = getattr(torch, self.hf_config.dtype)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -153,6 +153,7 @@ class Scheduler:
         if seq.block_table:
             self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.FINISHED
+        seq.mm = None
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
@@ -166,3 +167,4 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                seq.mm = None           # release vision features

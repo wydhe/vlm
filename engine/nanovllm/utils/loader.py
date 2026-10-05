@@ -17,7 +17,12 @@ def load_weights(model: nn.Module, named_tensors: Iterable[tuple[str, torch.Tens
     into the rollout engine (in-place copies keep CUDA-graph pointers valid).
     """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    name_mapping = getattr(model, "hf_name_mapping", ())
     for weight_name, tensor in named_tensors:
+        for src, dst in name_mapping:
+            if weight_name.startswith(src):
+                weight_name = dst + weight_name[len(src):]
+                break
         for k in packed_modules_mapping:
             if k in weight_name:
                 v, shard_id = packed_modules_mapping[k]
