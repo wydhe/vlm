@@ -17,6 +17,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     scheduling_policy: str = "mixed"    # "mixed" (prefill chunks + decodes per step) | "prefill_first" (upstream)
+    piecewise_cudagraph: bool = True    # CUDA graphs split at attention for mixed / prefill steps
+    piecewise_max_tokens: int = 2048    # largest captured token bucket; bigger steps run eager
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

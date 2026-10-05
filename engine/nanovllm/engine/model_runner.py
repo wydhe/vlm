@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.piecewise_graph import PiecewiseCudaGraphRunner
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -22,6 +23,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.piecewise = None  # set by capture_piecewise_cudagraph(); warmup runs before it
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -35,6 +37,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+            if config.piecewise_cudagraph:
+                self.capture_piecewise_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -55,6 +59,7 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            self.piecewise = None
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -193,8 +198,19 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def capture_piecewise_cudagraph(self):
+        """Capture attention-split graphs for varlen (mixed / prefill) steps."""
+        cap = min(self.config.piecewise_max_tokens, self.config.max_num_batched_tokens)
+        # fine buckets keep padding waste small: step 32 up to 512, then step 128 (<= ~12% padding)
+        candidates = list(range(32, 513, 32)) + list(range(640, 2049, 128))
+        sizes = sorted({s for s in candidates if s < cap} | {cap})
+        self.piecewise = PiecewiseCudaGraphRunner(self.model, sizes, pool=self.graph_pool)
+        self.piecewise.capture()
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        if is_prefill and self.piecewise is not None and self.piecewise.can_run(input_ids.size(0)):
+            return self.model.compute_logits(self.piecewise.run(input_ids, positions))
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:

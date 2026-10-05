@@ -177,6 +177,8 @@ def main() -> None:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--scheduling-policy", choices=["mixed", "prefill_first"], default="mixed")
+    p.add_argument("--no-piecewise-cudagraph", action="store_true",
+                   help="run mixed/prefill steps eagerly (ablation)")
     args = p.parse_args()
     if not args.model:
         p.error("pass --model or set MODEL_DIR")
@@ -186,7 +188,8 @@ def main() -> None:
                             max_num_batched_tokens=args.max_num_batched_tokens,
                             gpu_memory_utilization=args.gpu_memory_utilization,
                             enforce_eager=args.enforce_eager,
-                            scheduling_policy=args.scheduling_policy)
+                            scheduling_policy=args.scheduling_policy,
+                            piecewise_cudagraph=not args.no_piecewise_cudagraph)
     name = args.served_model_name or os.path.basename(os.path.normpath(args.model))
     uvicorn.run(build_app(engine, name), host=args.host, port=args.port, log_level="warning")
 
