@@ -124,6 +124,14 @@ class AsyncLLMEngine:
             if not finished:
                 self._inbox.put(("abort", req.request_id))
 
+    def stats(self) -> dict[str, float]:
+        """Cumulative prefix-cache counters (read racily from the engine thread; ints only)."""
+        bm = self._engine.scheduler.block_manager
+        total, cached = bm.num_prompt_tokens, bm.num_cached_prompt_tokens
+        return {"prompt_tokens": total, "cached_prompt_tokens": cached,
+                "prefix_cache_hit_rate": cached / total if total else 0.0,
+                "free_kv_blocks": len(bm.free_block_ids), "total_kv_blocks": len(bm.blocks)}
+
     def shutdown(self) -> None:
         """Stop the engine loop and wait for the thread to exit."""
         self._inbox.put(("stop", None))

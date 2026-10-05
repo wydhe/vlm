@@ -13,6 +13,9 @@ dependencies = [
     "numpy",
     "xxhash",
     "huggingface-hub",
+    "bm25s>=0.3.12",
+    "pystemmer>=3.1.0",
+    "pyarrow>=25.0.1",
 ]
 
 [dependency-groups]

@@ -56,6 +56,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(_SamplingFields):
     messages: list[ChatMessage]
+    tools: list[dict[str, Any]] | None = None   # OpenAI function schemas, rendered by the chat template
     chat_template_kwargs: dict[str, Any] | None = None
 
 
@@ -143,6 +144,10 @@ def build_app(engine: AsyncLLMEngine, model_name: str) -> FastAPI:
         return JSONResponse({"status": "ok"} if engine.is_alive else {"status": "dead"},
                             status_code=200 if engine.is_alive else 503)
 
+    @app.get("/metrics")
+    async def metrics():
+        return engine.stats()
+
     @app.get("/v1/models")
     async def models():
         return {"object": "list", "data": [{"id": model_name, "object": "model",
@@ -157,7 +162,8 @@ def build_app(engine: AsyncLLMEngine, model_name: str) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         ids = tokenizer.apply_chat_template([m.model_dump() for m in req.messages],
-                                            tokenize=True, add_generation_prompt=True,
+                                            tools=req.tools, tokenize=True,
+                                            add_generation_prompt=True,
                                             **(req.chat_template_kwargs or {}))
         return await run(list(ids), req, chat=True)
 
