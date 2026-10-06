@@ -180,6 +180,25 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+
+        # 混合步：调度器把 decode 序列（每条 1 个 token）排在最前面，后面是 prefill 分块。
+        # attention 分两段算：只要批里有 prefill，varlen kernel 就按 prefill 的查询长度给每条 decode
+        # 分配计算块，GQA 打包优化也会失效，实测 bs=224 时 attention 慢 4 倍。
+        num_decode = 0
+        while num_decode < len(seqs) and not seqs[num_decode].is_prefill:
+            num_decode += 1
+        decode_lens = None
+        if 0 < num_decode < len(seqs):
+            decode_lens = [cu_seqlens_k[i + 1] - cu_seqlens_k[i] for i in range(num_decode)]
+            prefill_q = [cu_seqlens_q[i + 1] - cu_seqlens_q[i] for i in range(num_decode, len(seqs))]
+            prefill_k = [cu_seqlens_k[i + 1] - cu_seqlens_k[i] for i in range(num_decode, len(seqs))]
+            cu_seqlens_q = [c - cu_seqlens_q[num_decode] for c in cu_seqlens_q[num_decode:]]
+            cu_seqlens_k = [c - cu_seqlens_k[num_decode] for c in cu_seqlens_k[num_decode:]]
+            max_seqlen_q, max_seqlen_k = max(prefill_q), max(prefill_k)
+            decode_lens = torch.tensor(decode_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            num_decode = 0
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if mrope:
             pos3 = torch.cat(mrope, dim=1)
@@ -196,8 +215,8 @@ class ModelRunner:
             mm_embeds = torch.cat([mm.embeds[lo:hi] for mm, lo, hi in mm_rows]).cuda(non_blocking=True)
             mm_deepstack = [torch.cat([mm.deepstack[k][lo:hi] for mm, lo, hi in mm_rows]).cuda(non_blocking=True)
                             for k in range(len(mm_rows[0][0].deepstack))]
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
-                    mm_embeds, mm_deepstack)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, decode_lens,
+                    block_tables, mm_embeds, mm_deepstack, num_decode_tokens=num_decode)
         return input_ids, positions
 
     @staticmethod

@@ -61,6 +61,19 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if context.is_prefill and context.num_decode_tokens:
+            # 混合步：前面的 decode 行用 decode kernel，后面的 prefill 行用 varlen kernel
+            n = context.num_decode_tokens
+            o_decode = flash_attn_with_kvcache(q[:n].unsqueeze(1), k_cache, v_cache,
+                                               cache_seqlens=context.context_lens,
+                                               block_table=context.block_tables[:n],
+                                               softmax_scale=self.scale, causal=True).squeeze(1)
+            o_prefill = flash_attn_varlen_func(q[n:], k_cache, v_cache,
+                                               max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                               max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                               softmax_scale=self.scale, causal=True,
+                                               block_table=context.block_tables[n:])
+            return torch.cat([o_decode, o_prefill])
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

@@ -56,7 +56,13 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
+            # 每条序列只取最后一个 token。混合步里前 n 行是 decode，每行就是它所在序列的最后一个 token；
+            # cu_seqlens_q 只描述后面的 prefill 部分，所以要加上偏移 n
+            n = context.num_decode_tokens
+            last_indices = context.cu_seqlens_q[1:] - 1 + n
+            if n:
+                decode_rows = torch.arange(n, dtype=last_indices.dtype, device=last_indices.device)
+                last_indices = torch.cat([decode_rows, last_indices])
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
