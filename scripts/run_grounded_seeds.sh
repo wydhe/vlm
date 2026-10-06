@@ -9,7 +9,10 @@ for seed in 0 1 2; do
       --served-model-name grpo-seed$seed --port 8000 --gpu-memory-utilization 0.6 --max-model-len 8192 \
       > results/server_grounded_seed$seed.log 2>&1 &
   SERVER_PID=$!
-  until curl -s --noproxy "*" localhost:8000/health > /dev/null; do sleep 5; done
+  until curl -s --noproxy "*" localhost:8000/health > /dev/null; do
+    kill -0 $SERVER_PID 2> /dev/null || { echo "server failed to start, see results/"; exit 1; }
+    sleep 5
+  done
   .venv/bin/python -m agent.grounded_qa --model grpo-seed$seed --label grpo-seed$seed-best | grep -v -i warn
   kill $SERVER_PID
   wait $SERVER_PID 2> /dev/null

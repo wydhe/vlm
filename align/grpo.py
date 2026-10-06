@@ -173,9 +173,13 @@ class Trainer:
     def save_bf16(self, out_dir: Path) -> None:
         """另存一份 bf16 权重，可以直接用 openai_server 部署；训练用的 fp32 权重不受影响。"""
         bf16_state = {name: t.to(torch.bfloat16) for name, t in self.policy.state_dict().items()}
-        self.policy.config.dtype = torch.bfloat16
         self.policy.save_pretrained(out_dir, state_dict=bf16_state, safe_serialization=True)
-        self.policy.config.dtype = torch.float32
+        # save_pretrained 按模型参数当前的类型（fp32）写 config.json，这里改成和权重一致的 bf16，
+        # 否则推理引擎会按 fp32 加载，flash-attn 不支持 fp32
+        config_file = out_dir / "config.json"
+        config = json.loads(config_file.read_text())
+        config["dtype"] = "bfloat16"
+        config_file.write_text(json.dumps(config, indent=2))
         for name in TOKENIZER_FILES:            # tokenizer 没有被训练，直接从原模型复制
             src = Path(self.args.model) / name
             if src.exists():

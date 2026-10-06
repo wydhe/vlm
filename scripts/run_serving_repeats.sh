@@ -18,7 +18,10 @@ start_server() {   # start_server <配置名>，后台启动服务，把 PID 写
                 --max-num-batched-tokens 16384 --disable-log-requests > results/server_rep_$1.log 2>&1 & ;;
   esac
   SERVER_PID=$!
-  until curl -s --noproxy "*" localhost:8000/health > /dev/null; do sleep 5; done
+  until curl -s --noproxy "*" localhost:8000/health > /dev/null; do
+    kill -0 $SERVER_PID 2> /dev/null || { echo "server failed to start, see results/"; exit 1; }
+    sleep 5
+  done
 }
 
 stop_server() {    # 结束服务，并等显存释放
