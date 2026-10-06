@@ -40,3 +40,17 @@
 - GRPO：PubMedQA（依据摘要 + 干扰文档，自动判定答案/引用/拒答）；MedQA / MedMCQA 做实现验证。
 - VLM：SLAKE（中英双语）、VQA-RAD、PathVQA、PMC-VQA。
 - 压测：ShareGPT（通用）、自有 RAG/Agent 请求轨迹（前缀复用）。
+
+## 第二轮（已完成，结果见 [项目总报告](PROJECT_REPORT.md)）
+
+| 顺序 | 内容 | 结果 |
+|---|---|---|
+| 1 | 闭环：GRPO 模型部署回 RAG / Agent 评测 | ✅ `p7_closed_loop.md` |
+| 2 | 重复实验：压测 3 次、GRPO 3 个种子 | ✅ `p8_robustness.md` |
+| 3 | overlap 调度 | 测量后不做（CPU 只占 2~4%），改为拆分混合步 attention，`p9_step_profiling.md` |
+| 4 | VL 批量视觉编码、服务端图片输入、演示界面 | ✅ `PROJECT_REPORT.md` §3.2 |
+| 5 | PubMed 全量语料 | ✅ `p10_pubmed_rag.md` |
+| 6 | 中文医学评测 | ✅（负面结果）`p11_chinese_rag.md` |
+| 7 | 推送 GitHub、技术博客 | 博客草稿 `blog_engine_profiling.md` |
+
+P4 Radix Tree、P7 Qwen3.5 未做，原因见总报告 §6、§10。
