@@ -2,6 +2,7 @@ import atexit
 from dataclasses import fields
 from itertools import accumulate
 
+import torch
 import xxhash
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -45,26 +46,66 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
-                    mm_inputs: dict | None = None):
-        """Queue a request. ``mm_inputs`` (Qwen3-VL): ``pixel_values`` and ``image_grid_thw``
-        from the HF processor; ``prompt`` must already contain the expanded image tokens."""
+                    mm_inputs: dict | None = None, vision: tuple | None = None):
+        """把一个请求加入调度队列。
+
+        多模态（Qwen3-VL）请求需要传 mm_inputs：HF processor 输出的 pixel_values 和
+        image_grid_thw，并且 prompt 里已经展开了图像占位 token。
+        vision 是已经算好的视觉特征 (embeds, deepstack)；不传就在这里现算。
+        """
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         if mm_inputs is not None:
-            seq.mm = self._prepare_mm(prompt, mm_inputs)
+            if vision is None:
+                vision = self.encode_images([mm_inputs])[0]
+            seq.mm = self._prepare_mm(prompt, mm_inputs, vision)
         self.scheduler.add(seq)
         return seq
 
-    def _prepare_mm(self, prompt: list[int], mm_inputs: dict) -> MMData:
-        """Encode images once and precompute M-RoPE positions / prefix-cache hash."""
+    def encode_images(self, mm_inputs: list[dict], max_patches: int = 32768) -> list[tuple]:
+        """批量视觉编码：把多个请求的图片拼成一批，跑完再按请求切开。
+
+        每批的 patch 总数不超过 max_patches，避免显存峰值过高。
+        返回每个请求的 (embeds, deepstack)，放在 CPU 锁页内存里：成千上万个排队请求的
+        视觉特征如果都留在 GPU 上会占几十 GB，prefill 时只把当前分块要用的行拷回 GPU。
+        """
+        merge = self.model_runner.model.spatial_merge_size
+        results = []
+        batch = []
+        batch_patches = 0
+
+        def flush():
+            if not batch:
+                return
+            pixel_values = torch.cat([m["pixel_values"] for m in batch])
+            grid = torch.cat([m["image_grid_thw"] for m in batch])
+            embeds, deepstack = self.model_runner.encode_images(pixel_values, grid)
+            # 每个请求占多少行 = 它所有图片的 t*h*w / merge^2
+            rows = [int(m["image_grid_thw"].prod(dim=1).sum()) // (merge * merge) for m in batch]
+            embed_parts = embeds.split(rows)
+            deep_parts = [layer.split(rows) for layer in deepstack]   # deep_parts[层][请求]
+            for i in range(len(batch)):
+                request_embeds = embed_parts[i].cpu().pin_memory()
+                request_deep = [deep_parts[layer][i].cpu().pin_memory() for layer in range(len(deepstack))]
+                results.append((request_embeds, request_deep))
+            batch.clear()
+
+        for m in mm_inputs:
+            patches = m["pixel_values"].size(0)
+            if batch and batch_patches + patches > max_patches:
+                flush()
+                batch_patches = 0
+            batch.append(m)
+            batch_patches += patches
+        flush()
+        return results
+
+    def _prepare_mm(self, prompt: list[int], mm_inputs: dict, vision: tuple) -> MMData:
+        """准备多模态请求的状态：M-RoPE 位置、图片内容哈希（用于前缀缓存）等。"""
         model = self.model_runner.model
         pixel_values, grid = mm_inputs["pixel_values"], mm_inputs["image_grid_thw"]
-        embeds, deepstack = self.model_runner.encode_images(pixel_values, grid)
-        # park features in pinned host memory: thousands of queued requests would otherwise pin
-        # tens of GB of GPU memory; prefill copies only the rows of the current chunk back
-        embeds = embeds.cpu().pin_memory()
-        deepstack = [d.cpu().pin_memory() for d in deepstack]
+        embeds, deepstack = vision
         positions, delta = mrope_positions(prompt, [tuple(g) for g in grid.tolist()],
                                            model.spatial_merge_size, model.image_token_id)
         h = xxhash.xxh64(pixel_values.float().cpu().numpy().tobytes())
@@ -111,8 +152,12 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         mm_inputs = mm_inputs or [None] * len(prompts)
+        # 先把所有图片批量编码，再逐个加入请求
+        with_images = [m for m in mm_inputs if m is not None]
+        encoded = iter(self.encode_images(with_images)) if with_images else iter(())
         for prompt, sp, mm in zip(prompts, sampling_params, mm_inputs):
-            self.add_request(prompt, sp, mm)
+            vision = next(encoded) if mm is not None else None
+            self.add_request(prompt, sp, mm, vision)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():

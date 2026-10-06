@@ -106,7 +106,10 @@ class Qwen3VLForCausalLM(nn.Module):
         for layer in self.model.layers:
             attn = layer.self_attn
             attn.rotary_emb = MRotaryEmbedding(attn.rotary_emb, section)
-        self.visual = Qwen3VLVisionModel._from_config(config.vision_config, attn_implementation="sdpa")
+        # flash_attention_2：多张图拼成一批时按 cu_seqlens 分段算 attention；
+        # sdpa 会构造覆盖整批的块对角掩码，计算量随总 patch 数平方增长，批量编码反而更慢
+        self.visual = Qwen3VLVisionModel._from_config(config.vision_config,
+                                                      attn_implementation="flash_attention_2")
 
     @torch.inference_mode()
     def encode_images(self, pixel_values: torch.Tensor,

@@ -10,6 +10,8 @@ Supported request fields: ``prompt`` (str or token ids, single prompt) / ``messa
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import time
@@ -20,7 +22,9 @@ from typing import Any, Literal
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel, Field
+from transformers import AutoProcessor
 
 from nanovllm.engine.async_engine import AsyncLLMEngine, EngineDeadError, RequestOutput
 from nanovllm.sampling_params import SamplingParams
@@ -51,7 +55,8 @@ class CompletionRequest(_SamplingFields):
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    # 字符串，或 OpenAI 格式的分片列表：{"type": "text", ...} / {"type": "image_url", ...}
+    content: str | list[dict[str, Any]]
 
 
 class ChatCompletionRequest(_SamplingFields):
@@ -74,17 +79,63 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "code": status}}, status_code=status)
 
 
-def build_app(engine: AsyncLLMEngine, model_name: str) -> FastAPI:
-    """Create the FastAPI app bound to a running engine."""
+def load_image(url: str) -> Image.Image:
+    """读取图片。支持 base64 的 data URL 和 file:// 本地路径。
+
+    故意不支持 http(s)：服务端去抓任意网址有 SSRF 风险，需要的话由客户端下载后转成 base64。
+    """
+    if url.startswith("data:"):
+        _, encoded = url.split(",", 1)
+        return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+    if url.startswith("file://"):
+        return Image.open(url[len("file://"):]).convert("RGB")
+    raise ValueError("image_url must be a data: URL or a file:// path")
+
+
+def has_images(messages: list[ChatMessage]) -> bool:
+    return any(isinstance(m.content, list) and any(p.get("type") == "image_url" for p in m.content)
+               for m in messages)
+
+
+def text_only(messages: list[ChatMessage]) -> list[dict]:
+    """把分片列表形式的纯文本消息拼成字符串，交给普通的 chat template。"""
+    result = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if p.get("type") == "text")
+        result.append({"role": m.role, "content": content})
+    return result
+
+
+def processor_messages(messages: list[ChatMessage]) -> list[dict]:
+    """转成 HF processor 认识的格式：图片分片换成 PIL 图片。"""
+    result = []
+    for m in messages:
+        if isinstance(m.content, str):
+            parts = [{"type": "text", "text": m.content}]
+        else:
+            parts = []
+            for p in m.content:
+                if p.get("type") == "image_url":
+                    parts.append({"type": "image", "image": load_image(p["image_url"]["url"])})
+                elif p.get("type") == "text":
+                    parts.append({"type": "text", "text": p["text"]})
+        result.append({"role": m.role, "content": parts})
+    return result
+
+
+def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAPI:
+    """Create the FastAPI app bound to a running engine (``processor``: Qwen3-VL only)."""
     app = FastAPI(title="nano-vllm")
     tokenizer = engine.tokenizer
 
-    async def run(prompt_ids: list[int], req: _SamplingFields, chat: bool):
+    async def run(prompt_ids: list[int], req: _SamplingFields, chat: bool, mm_inputs: dict | None = None):
         rid = f"{'chatcmpl' if chat else 'cmpl'}-{uuid.uuid4().hex}"
         created = int(time.time())
         obj = "chat.completion" if chat else "text_completion"
         try:
-            stream = engine.generate(prompt_ids, req.sampling_params(), rid)
+            stream = engine.generate(prompt_ids, req.sampling_params(), rid, mm_inputs)
             # pull the first update eagerly so validation errors become HTTP errors
             first = await anext(stream)
         except ValueError as e:
@@ -161,11 +212,23 @@ def build_app(engine: AsyncLLMEngine, model_name: str) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
-        ids = tokenizer.apply_chat_template([m.model_dump() for m in req.messages],
-                                            tools=req.tools, tokenize=True,
-                                            add_generation_prompt=True,
-                                            **(req.chat_template_kwargs or {}))
-        return await run(list(ids), req, chat=True)
+        template_kwargs = req.chat_template_kwargs or {}
+        if not has_images(req.messages):
+            ids = tokenizer.apply_chat_template(text_only(req.messages), tools=req.tools,
+                                                tokenize=True, add_generation_prompt=True,
+                                                **template_kwargs)
+            return await run(list(ids), req, chat=True)
+
+        if processor is None:
+            return _error(400, "this model does not accept images")
+        try:
+            encoded = processor.apply_chat_template(processor_messages(req.messages), tokenize=True,
+                                                    add_generation_prompt=True, return_dict=True,
+                                                    return_tensors="pt", **template_kwargs)
+        except (ValueError, OSError) as e:
+            return _error(400, f"bad image input: {e}")
+        mm_inputs = {"pixel_values": encoded["pixel_values"], "image_grid_thw": encoded["image_grid_thw"]}
+        return await run(encoded["input_ids"][0].tolist(), req, chat=True, mm_inputs=mm_inputs)
 
     return app
 
@@ -197,7 +260,8 @@ def main() -> None:
                             scheduling_policy=args.scheduling_policy,
                             piecewise_cudagraph=not args.no_piecewise_cudagraph)
     name = args.served_model_name or os.path.basename(os.path.normpath(args.model))
-    uvicorn.run(build_app(engine, name), host=args.host, port=args.port, log_level="warning")
+    processor = AutoProcessor.from_pretrained(args.model) if engine.is_multimodal else None
+    uvicorn.run(build_app(engine, name, processor), host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ class _Request:
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
     loop: asyncio.AbstractEventLoop
+    mm_inputs: dict | None = None       # Qwen3-VL: pixel_values + image_grid_thw
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     seq: Sequence | None = None
 
@@ -85,6 +86,7 @@ class AsyncLLMEngine:
             raise EngineDeadError("engine failed to start") from self._error
         config = self._engine.model_runner.config
         self.tokenizer = self._engine.tokenizer
+        self.is_multimodal: bool = config.mm_config is not None
         self.max_model_len: int = config.max_model_len
         self._max_seq_tokens: int = config.num_kvcache_blocks * config.kvcache_block_size
 
@@ -96,19 +98,22 @@ class AsyncLLMEngine:
         return self._error is None and self._thread.is_alive()
 
     async def generate(self, prompt_token_ids: list[int], sampling_params: SamplingParams,
-                       request_id: str | None = None) -> AsyncIterator[RequestOutput]:
+                       request_id: str | None = None,
+                       mm_inputs: dict | None = None) -> AsyncIterator[RequestOutput]:
         """Submit a request and stream its outputs.
 
         Closing the iterator early (e.g. client disconnect) aborts the request and
-        frees its KV cache blocks.
+        frees its KV cache blocks. ``mm_inputs`` carries image inputs for Qwen3-VL.
 
         Raises:
             ValueError: The request can never be scheduled.
             EngineDeadError: The engine thread is not running.
         """
         self._validate(prompt_token_ids, sampling_params)
+        if mm_inputs is not None and not self.is_multimodal:
+            raise ValueError("this model does not accept images")
         req = _Request(request_id or uuid.uuid4().hex, list(prompt_token_ids), sampling_params,
-                       asyncio.get_running_loop())
+                       asyncio.get_running_loop(), mm_inputs)
         self._inbox.put(("add", req))
         finished = False
         try:
@@ -184,7 +189,8 @@ class AsyncLLMEngine:
             if cmd == "stop":
                 return False
             if cmd == "add":
-                arg.seq = self._engine.add_request(arg.prompt_token_ids, arg.sampling_params)
+                arg.seq = self._engine.add_request(arg.prompt_token_ids, arg.sampling_params,
+                                                   arg.mm_inputs)
                 self._by_id[arg.request_id] = arg
                 self._by_seq[arg.seq.seq_id] = arg
             elif cmd == "abort":

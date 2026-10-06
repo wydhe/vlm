@@ -1,4 +1,5 @@
 import pickle
+import socket
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -14,6 +15,13 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+def find_free_port() -> int:
+    """向系统要一个当前空闲的 TCP 端口。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -26,7 +34,10 @@ class ModelRunner:
         self.event = event
         self.piecewise = None  # set by capture_piecewise_cudagraph(); warmup runs before it
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # 单卡时自动选一个空闲端口，这样一台机器上可以同时跑多个引擎（例如演示界面的两个模型）；
+        # 多卡张量并行时各进程必须用同一个端口，取 config.dist_port
+        port = config.dist_port if self.world_size > 1 else find_free_port()
+        dist.init_process_group("nccl", f"tcp://localhost:{port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)

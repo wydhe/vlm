@@ -22,6 +22,7 @@ class Config:
     piecewise_cudagraph: bool = True    # CUDA graphs split at attention for mixed / prefill steps
     piecewise_max_tokens: int = 2048    # largest captured token bucket; bigger steps run eager
     mm_config: AutoConfig | None = None  # full multimodal config (Qwen3-VL); hf_config is its text part
+    dist_port: int = 2333               # 多卡张量并行时进程间通信的端口；单卡时自动选空闲端口
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

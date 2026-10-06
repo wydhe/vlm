@@ -18,6 +18,12 @@ dependencies = [
     "bm25s>=0.3.12",
     "pystemmer>=3.1.0",
     "pyarrow>=25.0.1",
+    "jieba>=0.42.1",
+]
+
+[project.optional-dependencies]
+demo = [
+    "gradio>=6.17.3",
 ]
 
 [dependency-groups]
