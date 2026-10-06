@@ -11,10 +11,9 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def load_weights(model: nn.Module, named_tensors: Iterable[tuple[str, torch.Tensor]]):
-    """Copy HF-named tensors into the (packed, TP-sharded) engine model in place.
+    """把 HF 命名的张量原地拷进引擎模型（处理合并参数和张量并行切分）。
 
-    Used both for loading checkpoints and for syncing a trainer's live weights
-    into the rollout engine (in-place copies keep CUDA-graph pointers valid).
+    加载权重文件和 GRPO 训练中同步权重都用它；原地拷贝不改变显存地址，CUDA Graph 仍然有效。
     """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     name_mapping = getattr(model, "hf_name_mapping", ())

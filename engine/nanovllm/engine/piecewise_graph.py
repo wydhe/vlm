@@ -1,21 +1,18 @@
-"""Piecewise CUDA graphs for mixed / prefill steps (the vLLM V1 approach).
+"""混合步 / prefill 步的分段 CUDA Graph（vLLM V1 的做法）。
 
-A full CUDA graph cannot cover a varlen step: attention's ``cu_seqlens`` and
-block tables change shape every step. Everything *between* attentions is
-token-wise, so it only depends on the (padded) token count. We therefore cut
-the model at every attention call::
+整张 CUDA Graph 盖不住 varlen 步：attention 用到的 cu_seqlens 和 block table 每一步形状都不同。
+但 attention 之间的计算都是逐 token 的，只和（补齐后的）token 数有关。所以在每次 attention 处把模型切开：
 
-    piece 0      : embed            -> layer0 pre-attn   (q, k, v, residual)
-    attention 0  : eager (store KV + flash_attn_varlen over paged KV)
-    piece i      : layer i-1 post-attn -> layer i pre-attn
+    第 0 段       ：embedding → 第 0 层 attention 之前（输出 q, k, v, residual）
+    第 0 次 attention：eager 执行（写 KV + 分页 KV 上的 flash_attn_varlen）
+    第 i 段       ：第 i-1 层 attention 之后 → 第 i 层 attention 之前
     ...
-    piece L      : layer L-1 post-attn -> final norm      (hidden)
+    第 L 段       ：第 L-1 层 attention 之后 → 最终的 norm（输出 hidden）
 
-and capture the L+1 pieces once per token-count bucket. A step with T real
-tokens is padded to the next bucket; padded rows have ``slot_mapping = -1`` so
-they never touch the KV cache, and only the real rows reach attention and the
-LM head. All pieces of all buckets share one set of max-size static buffers
-(views ``[:T]``), so temporaries live in one graph memory pool.
+每个 token 数档位录制这 L+1 段图。一步有 T 个真实 token 时，补齐到下一个档位；补齐行的
+slot_mapping = -1，不会写 KV cache，attention 和 LM head 也只处理真实行。
+所有档位、所有分段共用一组按最大档位分配的静态缓冲区（用 [:T] 视图），临时张量都在同一个
+graph 内存池里，显存不会随档位数和层数成倍增长。
 """
 
 import gc
@@ -27,14 +24,14 @@ from nanovllm.utils.context import get_context
 
 
 class PiecewiseCudaGraphRunner:
-    """Capture and replay attention-split CUDA graphs for a Qwen3-style decoder."""
+    """为 Qwen3 结构的解码器录制、回放"以 attention 为界切开"的 CUDA Graph。"""
 
     def __init__(self, model: nn.Module, sizes: list[int], pool=None):
         """
         Args:
-            model: ``Qwen3ForCausalLM`` (needs ``model.model.{embed_tokens, layers, norm}``).
-            sizes: Token-count buckets to capture.
-            pool: Optional CUDA graph memory pool to share with other graphs.
+            model: Qwen3ForCausalLM（需要 model.model 下的 embed_tokens、layers、norm）。
+            sizes: 要录制的 token 数档位。
+            pool: 可选，和其他 CUDA Graph 共用的显存池。
         """
         inner = model.model
         self.embed = inner.embed_tokens
@@ -59,7 +56,7 @@ class PiecewiseCudaGraphRunner:
         self.graphs: dict[int, list[torch.cuda.CUDAGraph]] = {}
         self.pool = pool
 
-    # ------------------------------------------------------------------ pieces
+    # ------------------------------------------------------------------ 各段的计算
 
     def _pre_attn(self, i: int, hidden: torch.Tensor, residual: torch.Tensor | None, t: int) -> None:
         layer = self.layers[i]
@@ -89,7 +86,7 @@ class PiecewiseCudaGraphRunner:
         return layer.mlp(h), residual
 
     def _piece(self, p: int, t: int) -> None:
-        """Run graph piece ``p`` for ``t`` (padded) tokens; outputs go to static buffers."""
+        """对 t 个（补齐后的）token 执行第 p 段，结果写进静态缓冲区。"""
         if p == 0:
             self._pre_attn(0, self.embed(self.input_ids[:t]), None, t)
         elif p < len(self.layers):
@@ -101,26 +98,25 @@ class PiecewiseCudaGraphRunner:
             self.hidden[:t].copy_(hidden)
 
     def _attention(self, i: int, n: int) -> None:
-        """Eager attention for the ``n`` real tokens (KV write + varlen flash-attn)."""
+        """对 n 个真实 token 做 eager attention（写 KV + varlen flash-attn）。"""
         o = self.layers[i].self_attn.attn(self.q[:n], self.k[:n], self.v[:n])
         self.o[:n].copy_(o)
 
-    # ------------------------------------------------------------------ capture / run
+    # ------------------------------------------------------------------ 录制与回放
 
     @torch.inference_mode()
     def capture(self) -> None:
-        """Capture every bucket, largest first so the shared pool is sized once.
+        """录制所有档位。从最大的档位开始，这样共用的显存池只需要按最大需求分配一次。
 
-        Uses ``capture_begin``/``capture_end`` directly: the ``torch.cuda.graph`` context
-        runs ``gc.collect()`` + ``empty_cache()`` on every entry, which dominated startup
-        (hundreds of graphs) when the process holds a large Python heap.
+        直接用 capture_begin / capture_end：torch.cuda.graph 每次进入都会执行
+        gc.collect() 和 empty_cache()，要录几百张图、进程里 Python 对象又很多时，启动会非常慢。
         """
         num_pieces = len(self.layers) + 1
         stream = torch.cuda.Stream()
         gc.collect()
         torch.cuda.empty_cache()
         for t in reversed(self.sizes):
-            for p in range(num_pieces):          # warmup: trigger torch.compile outside capture
+            for p in range(num_pieces):          # 预热：让 torch.compile 在录制之前完成编译
                 self._piece(p, t)
             torch.cuda.synchronize()
             graphs = []
@@ -137,21 +133,21 @@ class PiecewiseCudaGraphRunner:
             torch.cuda.synchronize()
 
     def can_run(self, num_tokens: int) -> bool:
-        """Whether a step of ``num_tokens`` fits a captured bucket."""
+        """这一步的 token 数有没有对应的已录制档位。"""
         return num_tokens <= self.max_tokens
 
     @torch.inference_mode()
     def run(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Forward one varlen step; the attention context must already be set.
+        """前向计算一个 varlen 步（attention 用到的 context 需要事先设置好）。
 
         Returns:
-            Final hidden states for the real tokens, shape ``[n, hidden]``.
+            真实 token 的最终隐状态，形状 [n, hidden]。
         """
         n = input_ids.size(0)
         t = next(s for s in self.sizes if s >= n)
         self.input_ids[:n].copy_(input_ids)
         self.positions[:n].copy_(positions)
-        if t > n:                                # padded rows: harmless token 0 at position 0
+        if t > n:                                # 补齐行：填 token 0、位置 0，不影响结果
             self.input_ids[n:t].zero_()
             self.positions[n:t].zero_()
         assert get_context().slot_mapping.numel() == n

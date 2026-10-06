@@ -24,18 +24,17 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        """Pick the next batch. Returns (seqs, is_prefill); is_prefill means "run the varlen path"."""
+        """挑出下一步要跑的序列。返回 (seqs, is_prefill)；is_prefill 为 True 表示这一步走 varlen 路径。"""
         if self.policy == "mixed":
             return self._schedule_mixed()
         return self._schedule_prefill_first()
 
     def _schedule_mixed(self) -> tuple[list[Sequence], bool]:
-        """Stall-free batching under one token budget (vLLM V1 / Sarathi-Serve style).
+        """在一个 token 预算内混合调度 prefill 和 decode（vLLM V1 / Sarathi-Serve 的做法）。
 
-        1. Every running sequence gets its 1 decode token first, so an arriving
-           prompt never pauses ongoing generations.
-        2. The remaining budget prefills waiting sequences, chunking the last one.
-        Decode tokens ride in the same varlen forward as a q_len=1 "chunk".
+        1. 先给每条正在运行的序列安排 1 个 decode token，新来的 prompt 不会打断正在生成的请求。
+        2. 剩下的预算用来 prefill 等待中的序列，最后一条放不下就分块。
+        decode 可以看成"查询长度为 1 的分块"，和 prefill 一起放进同一次 varlen 前向。
         """
         scheduled_seqs = []
         budget = self.max_num_batched_tokens
@@ -59,7 +58,7 @@ class Scheduler:
                 scheduled_seqs.append(seq)
                 budget -= 1
         num_decode = len(scheduled_seqs)
-        # decoded seqs go back in their original order, ahead of the ones not scheduled this step
+        # 这一步排上的 decode 序列按原顺序放回队首，排在这一步没轮到的序列前面
         self.running.extendleft(reversed(scheduled_seqs))
 
         # 2. prefill: waiting sequences (including a partially prefilled head) with what is left
@@ -82,7 +81,7 @@ class Scheduler:
         return scheduled_seqs, len(scheduled_seqs) > num_decode
 
     def _schedule_prefill_first(self) -> tuple[list[Sequence], bool]:
-        """Upstream nano-vllm policy: a step is either all-prefill or all-decode."""
+        """上游 nano-vllm 的调度方式：一步要么全是 prefill，要么全是 decode。"""
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -139,14 +138,14 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def abort(self, seq: Sequence):
-        """Drop an unfinished sequence (e.g. client disconnected) and free its KV blocks.
+        """取消一条还没结束的序列（例如客户端断开），并释放它的 KV 块。
 
-        Must be called between steps, never while a scheduled batch is in flight.
+        只能在两步之间调用，不能在一个批正在计算时调用。
         """
         if seq.is_finished:
             return
         if seq.status == SequenceStatus.WAITING:
-            # a partially chunk-prefilled seq is still WAITING but already owns blocks
+            # 分块 prefill 做到一半的序列状态仍是 WAITING，但已经占了 KV 块
             self.waiting.remove(seq)
         else:
             self.running.remove(seq)
@@ -167,4 +166,4 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
-                seq.mm = None           # release vision features
+                seq.mm = None           # 释放视觉特征

@@ -1,18 +1,18 @@
-"""Asyncio front-end for ``LLMEngine``: one engine thread, per-request token streams.
+"""LLMEngine 的异步前端：一个独立的引擎线程 + 每个请求一条 token 流。
 
-Threading model::
+线程模型：
 
-    asyncio loop (HTTP)                         engine thread
-    ───────────────────                         ─────────────
-    generate() ──("add", req)──► inbox ──► drain inbox → add_request / abort
-                                              │
-                                              ▼
-                                        step_updates()  (GPU)
-                                              │  one call_soon_threadsafe per step
-    req.queue ◄──────── _deliver(batch) ◄─────┘
+    asyncio 事件循环（HTTP 服务）               引擎线程
+    ─────────────────────────────               ────────
+    generate() ──("add", 请求)──► 收件箱 ──► 取出命令 → add_request / abort
+                                                 │
+                                                 ▼
+                                           step_updates()（GPU 计算一步）
+                                                 │  每一步只调用一次 call_soon_threadsafe
+    请求的队列 ◄──────── _deliver(这一步的所有输出) ◄─┘
 
-The engine is constructed *inside* its thread because ``torch.set_default_device``
-and ``torch.cuda.set_device`` are thread-local.
+引擎必须在引擎线程里创建：torch.set_default_device 和 torch.cuda.set_device
+都只对当前线程生效。
 """
 
 import asyncio
@@ -31,12 +31,12 @@ from nanovllm.sampling_params import SamplingParams
 
 @dataclass(slots=True)
 class RequestOutput:
-    """One streaming update of a request."""
+    """一个请求的一次流式更新。"""
 
     request_id: str
-    token_ids: list[int]          # tokens sampled since the previous update
+    token_ids: list[int]          # 自上次更新以来新生成的 token
     finished: bool
-    finish_reason: str | None     # "stop" (EOS) | "length" (max_tokens) | None
+    finish_reason: str | None     # "stop"（遇到 EOS）| "length"（达到 max_tokens）| None
     num_prompt_tokens: int
     num_completion_tokens: int
 
@@ -53,28 +53,28 @@ class _Request:
 
 
 def _deliver(items: list[tuple[asyncio.Queue, Any]]) -> None:
-    """Runs on the event loop: fan one engine step's outputs out to request queues."""
+    """在事件循环里运行：把引擎一步的所有输出分发到各个请求的队列。"""
     for q, item in items:
         q.put_nowait(item)
 
 
 class EngineDeadError(RuntimeError):
-    """The engine thread has crashed or been shut down."""
+    """引擎线程已崩溃或已关闭。"""
 
 
 class AsyncLLMEngine:
-    """Serve concurrent async requests from a single ``LLMEngine``."""
+    """用一个 LLMEngine 同时服务多个异步请求。"""
 
     def __init__(self, model: str, **engine_kwargs: Any):
-        """Start the engine thread and block until the model is loaded.
+        """启动引擎线程，并等到模型加载完成。
 
         Args:
-            model: Local checkpoint directory.
-            **engine_kwargs: Forwarded to ``LLMEngine`` / ``Config``.
+            model: 本地模型目录。
+            **engine_kwargs: 透传给 LLMEngine / Config。
         """
         self._inbox: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
-        self._by_id: dict[str, _Request] = {}      # engine-thread only
-        self._by_seq: dict[int, _Request] = {}     # engine-thread only
+        self._by_id: dict[str, _Request] = {}      # 只在引擎线程里读写
+        self._by_seq: dict[int, _Request] = {}     # 只在引擎线程里读写
         self._error: BaseException | None = None
         self._ready = threading.Event()
         self._engine: LLMEngine | None = None
@@ -94,20 +94,20 @@ class AsyncLLMEngine:
 
     @property
     def is_alive(self) -> bool:
-        """Whether the engine thread is running and healthy."""
+        """引擎线程是否在正常运行。"""
         return self._error is None and self._thread.is_alive()
 
     async def generate(self, prompt_token_ids: list[int], sampling_params: SamplingParams,
                        request_id: str | None = None,
                        mm_inputs: dict | None = None) -> AsyncIterator[RequestOutput]:
-        """Submit a request and stream its outputs.
+        """提交一个请求，逐步返回它的输出。
 
-        Closing the iterator early (e.g. client disconnect) aborts the request and
-        frees its KV cache blocks. ``mm_inputs`` carries image inputs for Qwen3-VL.
+        提前关闭这个迭代器（例如客户端断开连接）会取消请求，并释放它占用的 KV 块。
+        mm_inputs 是 Qwen3-VL 的图像输入。
 
         Raises:
-            ValueError: The request can never be scheduled.
-            EngineDeadError: The engine thread is not running.
+            ValueError: 这个请求永远不可能被调度（太长等）。
+            EngineDeadError: 引擎线程没有在运行。
         """
         self._validate(prompt_token_ids, sampling_params)
         if mm_inputs is not None and not self.is_multimodal:
@@ -130,7 +130,7 @@ class AsyncLLMEngine:
                 self._inbox.put(("abort", req.request_id))
 
     def stats(self) -> dict[str, float]:
-        """Cumulative prefix-cache counters (read racily from the engine thread; ints only)."""
+        """累计的前缀缓存统计。直接读引擎线程里的整数计数器，不加锁，可能有微小的不一致。"""
         bm = self._engine.scheduler.block_manager
         total, cached = bm.num_prompt_tokens, bm.num_cached_prompt_tokens
         return {"prompt_tokens": total, "cached_prompt_tokens": cached,
@@ -138,7 +138,7 @@ class AsyncLLMEngine:
                 "free_kv_blocks": len(bm.free_block_ids), "total_kv_blocks": len(bm.blocks)}
 
     def shutdown(self) -> None:
-        """Stop the engine loop and wait for the thread to exit."""
+        """停止引擎循环，并等待线程退出。"""
         self._inbox.put(("stop", None))
         self._thread.join()
 
@@ -154,7 +154,7 @@ class AsyncLLMEngine:
             raise ValueError(f"prompt ({len(prompt_token_ids)}) + max_tokens ({sp.max_tokens}) "
                              f"exceeds max_model_len ({self.max_model_len})")
         if total > self._max_seq_tokens:
-            # would sit at the head of the waiting queue forever and block everyone
+            # 这样的请求会永远卡在等待队列队头，堵住后面所有请求
             raise ValueError(f"request needs {total} tokens of KV cache, "
                              f"only {self._max_seq_tokens} available")
 
@@ -163,7 +163,7 @@ class AsyncLLMEngine:
     def _run(self, model: str, engine_kwargs: dict[str, Any]) -> None:
         try:
             self._engine = LLMEngine(model, **engine_kwargs)
-        except BaseException as e:  # noqa: BLE001 - surfaced to the constructor
+        except BaseException as e:  # noqa: BLE001 - 由构造函数抛给调用方
             self._error = e
             self._ready.set()
             return
@@ -175,12 +175,12 @@ class AsyncLLMEngine:
                     continue
                 emitted, _ = engine.step_updates()
                 self._publish(emitted)
-        except BaseException as e:  # noqa: BLE001 - propagate to all waiters
+        except BaseException as e:  # noqa: BLE001 - 通知所有等待中的请求
             self._error = e
             self._fail_all(e)
 
     def _drain_inbox(self, block: bool) -> bool:
-        """Apply pending add/abort commands. Returns False on shutdown."""
+        """处理收件箱里的 add / abort 命令。收到 stop 时返回 False。"""
         try:
             cmd, arg = self._inbox.get() if block else self._inbox.get_nowait()
         except queue.Empty:
@@ -221,7 +221,7 @@ class AsyncLLMEngine:
         for loop, items in batches.items():
             try:
                 loop.call_soon_threadsafe(_deliver, items)
-            except RuntimeError:  # event loop already closed
+            except RuntimeError:  # 事件循环已经关闭
                 pass
 
     def _fail_all(self, error: BaseException) -> None:

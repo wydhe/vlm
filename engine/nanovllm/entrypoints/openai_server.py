@@ -1,12 +1,11 @@
-"""OpenAI-compatible HTTP server (``/v1/completions``, ``/v1/chat/completions``).
+"""OpenAI 兼容的 HTTP 服务（/v1/completions、/v1/chat/completions）。
 
-Usage:
+用法：
     python -m nanovllm.entrypoints.openai_server --model weights/Qwen3-8B --port 8000
 
-Supported request fields: ``prompt`` (str or token ids, single prompt) / ``messages``,
-``max_tokens``, ``temperature`` (0 = greedy), ``stream``,
-``stream_options.include_usage``, ``ignore_eos`` and, for chat,
-``chat_template_kwargs`` (e.g. ``{"enable_thinking": false}`` for Qwen3).
+支持的请求字段：prompt（字符串或 token id，单条）/ messages（可以带 image_url 图片分片，
+仅 Qwen3-VL）、max_tokens、temperature（0 表示贪心）、stream、stream_options.include_usage、
+ignore_eos；聊天接口还支持 tools 和 chat_template_kwargs（例如 Qwen3 的 {"enable_thinking": false}）。
 """
 
 import argparse
@@ -126,7 +125,7 @@ def processor_messages(messages: list[ChatMessage]) -> list[dict]:
 
 
 def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAPI:
-    """Create the FastAPI app bound to a running engine (``processor``: Qwen3-VL only)."""
+    """创建绑定到运行中引擎的 FastAPI 应用（processor 只有 Qwen3-VL 需要）。"""
     app = FastAPI(title="nano-vllm")
     tokenizer = engine.tokenizer
 
@@ -136,7 +135,7 @@ def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAP
         obj = "chat.completion" if chat else "text_completion"
         try:
             stream = engine.generate(prompt_ids, req.sampling_params(), rid, mm_inputs)
-            # pull the first update eagerly so validation errors become HTTP errors
+            # 先取第一条输出，这样参数校验失败能变成 HTTP 错误码返回
             first = await anext(stream)
         except ValueError as e:
             return _error(400, str(e))
@@ -174,7 +173,7 @@ def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAP
         async def sse() -> AsyncIterator[str]:
             chunk_obj = f"{obj}.chunk" if chat else obj
             try:
-                # one chunk per sampled token (text may be "" while a multi-byte char is pending)
+                # 每生成一个 token 发一个分片（多字节字符还没拼完整时，text 可能是空字符串）
                 async for text, out in updates():
                     yield _sse({"id": rid, "object": chunk_obj, "created": created,
                                 "model": model_name,
@@ -185,7 +184,7 @@ def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAP
             except EngineDeadError as e:
                 yield _sse({"error": {"message": str(e), "code": 503}})
             finally:
-                await stream.aclose()  # aborts the request if the client went away
+                await stream.aclose()  # 客户端断开时，会在这里取消请求
             yield _sse("[DONE]")
 
         return StreamingResponse(sse(), media_type="text/event-stream")
@@ -234,7 +233,7 @@ def build_app(engine: AsyncLLMEngine, model_name: str, processor=None) -> FastAP
 
 
 def main() -> None:
-    """Parse CLI arguments, load the model and serve."""
+    """解析命令行参数，加载模型，启动服务。"""
     p = argparse.ArgumentParser(description="nano-vllm OpenAI-compatible server")
     p.add_argument("--model", default=os.environ.get("MODEL_DIR"), help="checkpoint dir (default: $MODEL_DIR)")
     p.add_argument("--served-model-name", default=None)

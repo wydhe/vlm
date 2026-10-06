@@ -32,7 +32,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self.piecewise = None  # set by capture_piecewise_cudagraph(); warmup runs before it
+        self.piecewise = None  # 由 capture_piecewise_cudagraph() 设置；warmup 在它之前运行
 
         # 单卡时自动选一个空闲端口，这样一台机器上可以同时跑多个引擎（例如演示界面的两个模型）；
         # 多卡张量并行时各进程必须用同一个端口，取 config.dist_port
@@ -155,14 +155,14 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        mrope = []                          # per-seq [3, n] M-RoPE positions (Qwen3-VL only)
-        mm_rows = []                        # (seq.mm, first_row, last_row) image-token feature rows
+        mrope = []                          # 每条序列的 [3, n] M-RoPE 位置（只有 Qwen3-VL 用）
+        mm_rows = []                        # (seq.mm, 起始行, 结束行)：这一步要用到的视觉特征行
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            # a decode seq in a mixed batch is a q_len=1 chunk; on TP workers it only carries last_token
+            # 混合批里的 decode 序列相当于长度为 1 的分块；张量并行的其他进程只收到 last_token
             input_ids.extend(seq[start:end] if seq.is_prefill else [seq.last_token])
             positions.extend(range(start, end))
             if self.config.mm_config is not None:
@@ -213,7 +213,7 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if mrope:
             pos3 = torch.cat(mrope, dim=1)
-            # text-only chunks have t == h == w: keep 1-D positions (graph-capturable)
+            # 纯文本分块的 t == h == w，用一维位置即可（可以走 CUDA Graph）
             positions = pos3[0] if torch.equal(pos3[0], pos3[1]) and torch.equal(pos3[0], pos3[2]) else pos3
             positions = positions.pin_memory().cuda(non_blocking=True)
         else:
@@ -233,7 +233,7 @@ class ModelRunner:
     @staticmethod
     def _mrope_chunk(seq: Sequence, start: int, end: int) -> torch.Tensor:
         """[3, end - start] M-RoPE positions; tokens past the prompt sit at ``i + delta``."""
-        # explicit CPU: during init the default device is CUDA, and these get pinned + copied
+        # 显式放在 CPU：初始化期间默认设备是 CUDA，而这些张量之后要锁页再拷到 GPU
         if seq.mm is None:
             return torch.arange(start, end, device="cpu").view(1, -1).expand(3, -1)
         n_prompt = seq.mm.positions.size(1)
@@ -246,7 +246,7 @@ class ModelRunner:
         return torch.cat(parts, dim=1)
 
     def encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
-        """Vision tower forward for one request (Qwen3-VL); returns (embeds, deepstack)."""
+        """跑视觉编码器（Qwen3-VL），返回 (embeds, deepstack)。"""
         return self.model.encode_images(pixel_values, grid_thw)
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -273,9 +273,9 @@ class ModelRunner:
         return temperatures
 
     def capture_piecewise_cudagraph(self):
-        """Capture attention-split graphs for varlen (mixed / prefill) steps."""
+        """为 varlen 步（混合步 / prefill 步）录制以 attention 为界切分的 CUDA Graph。"""
         cap = min(self.config.piecewise_max_tokens, self.config.max_num_batched_tokens)
-        # fine buckets keep padding waste small: step 32 up to 512, then step 128 (<= ~12% padding)
+        # 档位细一些，补齐浪费才小：512 以内每 32 一档，之后每 128 一档（浪费不超过约 12%）
         candidates = list(range(32, 513, 32)) + list(range(640, 2049, 128))
         sizes = sorted({s for s in candidates if s < cap} | {cap})
         self.piecewise = PiecewiseCudaGraphRunner(self.model, sizes, pool=self.graph_pool)

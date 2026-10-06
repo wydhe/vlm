@@ -1,4 +1,4 @@
-"""Build BM25 + MedCPT dense indexes for a MedRAG corpus.
+"""为 MedRAG 语料建立 BM25 和 MedCPT 向量索引。
 
 Usage:
     uv run python -m rag.build_index --corpus data/medrag/textbooks/chunk \
@@ -18,7 +18,7 @@ from rag.retrievers import BM25Retriever, MedCPTEncoder, load_chunks
 
 
 def main() -> None:
-    """Parse CLI arguments and write ``ids.json``, ``dense_fp16.npy`` and ``bm25/``."""
+    """解析命令行参数，写出 ids.json、dense_fp16.npy 和 bm25/。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--corpus", required=True, help="directory of *.jsonl chunks")
     p.add_argument("--out", required=True, help="index output directory")
@@ -38,7 +38,7 @@ def main() -> None:
     print(f"bm25 index: {time.perf_counter() - t:.1f}s")
 
     t = time.perf_counter()
-    # sort by length so each batch pads little; restore the original order afterwards
+    # 按长度排序，每批的 padding 更少；算完再恢复原来的顺序
     order = sorted(range(len(chunks)), key=lambda i: len(chunks[i]["content"]))
     enc = MedCPTEncoder(args.query_model, args.article_model)
     emb_sorted = enc.encode_articles([chunks[i] for i in order], args.batch_size)

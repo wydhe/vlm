@@ -18,10 +18,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    scheduling_policy: str = "mixed"    # "mixed" (prefill chunks + decodes per step) | "prefill_first" (upstream)
-    piecewise_cudagraph: bool = True    # CUDA graphs split at attention for mixed / prefill steps
-    piecewise_max_tokens: int = 2048    # largest captured token bucket; bigger steps run eager
-    mm_config: AutoConfig | None = None  # full multimodal config (Qwen3-VL); hf_config is its text part
+    scheduling_policy: str = "mixed"    # "mixed"（每步混合 prefill 分块和 decode）| "prefill_first"（上游的方式）
+    piecewise_cudagraph: bool = True    # 混合步 / prefill 步使用以 attention 为界切分的 CUDA Graph
+    piecewise_max_tokens: int = 2048    # 录制的最大 token 档位，更大的步走 eager
+    mm_config: AutoConfig | None = None  # 完整的多模态配置（Qwen3-VL）；hf_config 是其中的文本部分
     dist_port: int = 2333               # 多卡张量并行时进程间通信的端口；单卡时自动选空闲端口
 
     def __post_init__(self):

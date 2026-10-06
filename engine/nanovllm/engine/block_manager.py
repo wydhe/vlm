@@ -31,7 +31,7 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
-        # prefix-cache accounting (cumulative over allocations, incl. re-admission after preemption)
+        # 前缀缓存统计（所有分配的累计值，被抢占后重新加入的也算）
         self.num_prompt_tokens = 0
         self.num_cached_prompt_tokens = 0
 
@@ -46,10 +46,10 @@ class BlockManager:
         return h.intdigest()
 
     def _extra(self, seq: Sequence, i: int) -> int:
-        """Image content hash for blocks at/after the first image token.
+        """从第一个图像 token 所在的块开始，返回图片内容哈希，混进块哈希里。
 
-        Image placeholder tokens are identical for every image, so without this two
-        different images would hash to the same block and silently share KV.
+        所有图片的占位 token 都一样，不混入图片哈希的话，两张不同的图片会算出相同的块哈希，
+        悄悄共用 KV。
         """
         if seq.mm is not None and (i + 1) * self.block_size > seq.mm.first_image_pos:
             return seq.mm.image_hash
@@ -118,10 +118,10 @@ class BlockManager:
         seq.block_table.clear()
 
     def reset_prefix_cache(self):
-        """Forget all cached prefixes, e.g. after the model weights were updated in place.
+        """清空所有前缀缓存，例如模型权重被原地更新之后。
 
-        Cached KV was computed by the old weights; reusing it after an RL weight sync
-        would silently make rollouts off-policy. Only valid when no sequence holds blocks.
+        缓存的 KV 是旧权重算出来的；强化学习同步权重后还复用它们，rollout 会悄悄变成
+        off-policy。只能在没有序列占用 KV 块时调用。
         """
         assert not self.used_block_ids, "reset_prefix_cache with live sequences"
         self.hash_to_block_id.clear()

@@ -6,7 +6,7 @@ class Sampler(nn.Module):
 
     @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        # temperature == 0 -> deterministic greedy (argmax breaks bf16 ties by lowest index)
+        # temperature == 0 时走确定性的贪心（argmax 遇到 bf16 并列时取下标最小的）
         greedy_tokens = logits.argmax(dim=-1)
         logits = logits.float().div_(temperatures.clamp_min(1e-5).unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

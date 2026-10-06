@@ -1,12 +1,12 @@
-"""Two-stage medical retrieval: BM25 + MedCPT dense -> RRF fusion -> MedCPT cross-encoder rerank.
+"""两阶段医学检索：BM25 + MedCPT 向量检索 → RRF 融合 → MedCPT 交叉编码器重排。
 
-Index layout under ``<index_dir>``::
+索引目录的内容：
 
-    ids.json            chunk ids, row-aligned with the dense matrix
-    dense_fp16.npy      [N, 768] MedCPT article embeddings (CLS), fp16
-    bm25/               bm25s index (stemmed English)
+    ids.json            片段 id，和向量矩阵的行一一对应
+    dense_fp16.npy      [N, 768] 的 MedCPT 文章向量（CLS），fp16
+    bm25/               bm25s 索引（英文词干化）
 
-Chunks come from MedRAG corpora: one JSON object per line ``{"id", "title", "content"}``.
+语料来自 MedRAG：每行一个 JSON 对象 {"id", "title", "content"}。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 
 @dataclass(slots=True)
 class Hit:
-    """One retrieved chunk with the score of the stage that produced it."""
+    """一条检索结果，score 是产生它的那一阶段给的分数。"""
 
     id: str
     title: str
@@ -33,7 +33,7 @@ class Hit:
 
 
 def load_chunks(corpus_dir: str | Path) -> list[dict]:
-    """Load every ``*.jsonl`` chunk file of a MedRAG corpus directory, sorted by file name."""
+    """按文件名顺序读取 MedRAG 语料目录下所有 *.jsonl 文件。"""
     chunks: list[dict] = []
     for path in sorted(Path(corpus_dir).glob("*.jsonl")):
         with open(path) as f:
@@ -41,10 +41,10 @@ def load_chunks(corpus_dir: str | Path) -> list[dict]:
     return chunks
 
 
-# --------------------------------------------------------------------------- sparse
+# --------------------------------------------------------------------------- 稀疏检索
 
 class BM25Retriever:
-    """Lexical retrieval with bm25s (Snowball-stemmed English, stopwords removed)."""
+    """用 bm25s 做关键词检索（英文 Snowball 词干化，去停用词）。"""
 
     def __init__(self, retriever: bm25s.BM25):
         self.retriever = retriever
@@ -52,7 +52,7 @@ class BM25Retriever:
 
     @classmethod
     def build(cls, chunks: list[dict]) -> BM25Retriever:
-        """Index ``title + content`` of every chunk."""
+        """对每个片段的 "标题 + 正文" 建索引。"""
         stemmer = Stemmer.Stemmer("english")
         tokens = bm25s.tokenize([f"{c['title']} {c['content']}" for c in chunks],
                                 stopwords="en", stemmer=stemmer, show_progress=False)
@@ -68,16 +68,16 @@ class BM25Retriever:
         return cls(bm25s.BM25.load(str(path)))
 
     def search(self, queries: list[str], k: int) -> list[list[tuple[int, float]]]:
-        """Return, per query, ``k`` (row, score) pairs sorted by score."""
+        """每个问题返回 k 个 (行号, 分数)，按分数从高到低排序。"""
         tokens = bm25s.tokenize(queries, stopwords="en", stemmer=self.stemmer, show_progress=False)
         rows, scores = self.retriever.retrieve(tokens, k=k, show_progress=False, n_threads=8)
         return [list(zip(r.tolist(), s.tolist())) for r, s in zip(rows, scores)]
 
 
-# --------------------------------------------------------------------------- dense
+# --------------------------------------------------------------------------- 稠密检索
 
 class MedCPTEncoder:
-    """MedCPT bi-encoder (NCBI): separate query and article encoders, CLS pooling, dot product."""
+    """MedCPT 双塔模型（NCBI）：问题和文章用两个不同的编码器，取 CLS 向量，用内积算相似度。"""
 
     def __init__(self, query_model: str, article_model: str | None = None, device: str = "cuda"):
         self.device = device
@@ -90,7 +90,7 @@ class MedCPTEncoder:
 
     @torch.inference_mode()
     def encode_queries(self, queries: list[str], batch_size: int = 256) -> torch.Tensor:
-        """Return ``[len(queries), 768]`` fp16 query embeddings on ``device``."""
+        """返回问题向量，形状 [问题数, 768]，fp16，在 device 上。"""
         out = []
         for i in range(0, len(queries), batch_size):
             enc = self.q_tok(queries[i:i + batch_size], truncation=True, padding=True,
@@ -100,7 +100,7 @@ class MedCPTEncoder:
 
     @torch.inference_mode()
     def encode_articles(self, chunks: list[dict], batch_size: int = 256) -> np.ndarray:
-        """Return ``[len(chunks), 768]`` fp16 article embeddings (title/content pairs, max 512 tokens)."""
+        """返回文章向量，形状 [片段数, 768]，fp16（输入是 标题/正文 对，最多 512 token）。"""
         assert self.a_enc is not None, "article encoder not loaded"
         out = []
         for i in range(0, len(chunks), batch_size):
@@ -113,7 +113,7 @@ class MedCPTEncoder:
 
 
 class DenseRetriever:
-    """Exact inner-product search over a GPU-resident embedding matrix."""
+    """向量矩阵放在 GPU 上，用内积做精确检索。"""
 
     def __init__(self, encoder: MedCPTEncoder, embeddings: np.ndarray):
         self.encoder = encoder
@@ -125,10 +125,10 @@ class DenseRetriever:
         return [list(zip(r.tolist(), s.float().tolist())) for r, s in zip(rows, scores)]
 
 
-# --------------------------------------------------------------------------- fusion / rerank
+# --------------------------------------------------------------------------- 融合与重排
 
 def rrf_fuse(rankings: list[list[tuple[int, float]]], k: int, c: int = 60) -> list[tuple[int, float]]:
-    """Reciprocal rank fusion: ``score(d) = sum_r 1 / (c + rank_r(d))`` over input rankings."""
+    """倒数排名融合（RRF）：score(d) = Σ 1 / (c + d 在各个排名里的名次)。"""
     fused: dict[int, float] = {}
     for ranking in rankings:
         for rank, (row, _) in enumerate(ranking, start=1):
@@ -137,7 +137,7 @@ def rrf_fuse(rankings: list[list[tuple[int, float]]], k: int, c: int = 60) -> li
 
 
 class CrossEncoderReranker:
-    """MedCPT cross-encoder: scores (query, article) pairs jointly."""
+    """MedCPT 交叉编码器：把（问题, 文章）放在一起打分。"""
 
     def __init__(self, model: str, device: str = "cuda"):
         self.device = device
@@ -157,10 +157,10 @@ class CrossEncoderReranker:
         return scores
 
 
-# --------------------------------------------------------------------------- pipeline
+# --------------------------------------------------------------------------- 完整流程
 
 class HybridRetriever:
-    """BM25 + dense candidates, RRF fused, optionally cross-encoder reranked."""
+    """BM25 和向量检索各取候选，RRF 融合，可选交叉编码器重排。"""
 
     MODES = ("bm25", "dense", "hybrid", "hybrid_rerank")
 
@@ -175,7 +175,7 @@ class HybridRetriever:
     @classmethod
     def from_index(cls, corpus_dir: str | Path, index_dir: str | Path, query_model: str,
                    reranker_model: str | None = None, device: str = "cuda") -> HybridRetriever:
-        """Load chunks, BM25 and dense indexes built by ``rag.build_index``."""
+        """加载语料，以及 rag.build_index 建好的 BM25 和向量索引。"""
         index_dir = Path(index_dir)
         chunks = load_chunks(corpus_dir)
         ids = json.loads((index_dir / "ids.json").read_text())
@@ -190,12 +190,12 @@ class HybridRetriever:
                 for r, s in ranking]
 
     def search(self, queries: list[str], k: int = 5, mode: str = "hybrid_rerank") -> list[list[Hit]]:
-        """Retrieve ``k`` chunks per query.
+        """每个问题检索 k 个片段。
 
         Args:
-            queries: Natural-language queries.
-            k: Chunks returned per query.
-            mode: One of ``HybridRetriever.MODES``.
+            queries: 自然语言问题。
+            k: 每个问题返回几个片段。
+            mode: HybridRetriever.MODES 之一。
         """
         assert mode in self.MODES, mode
         if mode == "bm25":

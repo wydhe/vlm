@@ -1,8 +1,7 @@
-"""Per-step latency: decode-only (CUDA graph) steps vs mixed steps with a prefill chunk.
+"""单步耗时：纯 decode 步（CUDA Graph）对比混入一段 prefill 的混合步。
 
-Holds ``bs`` sequences in steady decode, then times single engine steps that add
-one fresh prompt of a given length (random tokens, so no prefix-cache hits).
-Separates the cost of "a mixed step runs eager" from the prefill compute itself.
+先让 bs 条序列进入稳定的 decode 状态，然后每一步混入一条指定长度的新 prompt（随机 token，
+不会命中前缀缓存），测单步耗时。用来区分"混合步走 eager 的固定开销"和 prefill 本身的计算量。
 
 Usage:
     uv run python -m bench.step_cost --model weights/Qwen3-8B
@@ -22,7 +21,7 @@ from nanovllm.sampling_params import SamplingParams
 
 
 def timed_step(engine: LLMEngine) -> float:
-    """Run one engine step and return its wall time in ms (GPU-synchronized)."""
+    """执行引擎的一步，返回墙钟耗时（毫秒，前后都做了 GPU 同步）。"""
     torch.cuda.synchronize()
     start = time.perf_counter()
     engine.step_updates()
@@ -31,14 +30,14 @@ def timed_step(engine: LLMEngine) -> float:
 
 
 def reset(engine: LLMEngine) -> None:
-    """Drop all sequences and return every KV block to the free pool."""
+    """取消所有序列，把 KV 块全部还回空闲池。"""
     sched = engine.scheduler
     for seq in list(sched.running) + list(sched.waiting):
         sched.abort(seq)
 
 
 def main() -> None:
-    """Measure median step latency for several decode batch sizes and prefill lengths."""
+    """对不同的 decode batch 大小和 prefill 长度，测单步耗时的中位数。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", default=os.environ.get("MODEL_DIR"))
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[32, 128, 224])

@@ -1,17 +1,14 @@
-"""Grounded-answer task for GRPO: cite the supporting abstract, or refuse when none supports the answer.
+"""GRPO 的训练任务：引用支撑答案的文献作答；没有文献支撑时拒答。
 
-Each sample shows ``n_docs`` PubMed abstracts: the question's own abstract ("gold")
-plus BM25-nearest distractors, shuffled. With probability ``p_unanswerable`` the
-gold abstract is swapped for another distractor and the correct reply becomes
-``insufficient``. Everything is automatically verifiable, so no reward model or
-LLM judge is needed.
+每道题给 n_docs 篇 PubMed 摘要：题目自己的原始摘要（gold），加上 BM25 找出的最相似干扰摘要，顺序打乱。
+以 p_unanswerable 的概率把 gold 换成另一篇干扰摘要，这时正确的回答是 insufficient（资料不足）。
+所有奖励都能自动判定，不需要奖励模型，也不需要 LLM 当评委。
 
-Train samples come from ``pqa_artificial``; eval samples from ``pqa_labeled``
-(disjoint from training, and the source of MIRAGE's PubMedQA split).
+训练样本来自 pqa_artificial；评测样本来自 pqa_labeled（和训练集不重叠，也是 MIRAGE 中 PubMedQA 的来源）。
 
-Sample (one JSON line)::
+每条样本（一行 JSON）：
 
-    {"question": str, "docs": [str, ...], "gold": int (0-based, -1 if unanswerable),
+    {"question": 问题, "docs": [摘要, ...], "gold": 原始摘要的下标（从 0 开始，不可回答时为 -1）,
      "label": "yes" | "no" | "maybe" | "insufficient"}
 """
 
@@ -52,10 +49,9 @@ def _abstract(row: dict) -> str:
 
 def build_samples(rows: list[dict], n: int, n_docs: int, p_unanswerable: float,
                   rng: random.Random, balance: bool = False) -> list[dict]:
-    """Assemble ``n`` samples from PubMedQA rows with BM25-nearest distractor abstracts.
+    """从 PubMedQA 里构造 n 条样本，干扰摘要用 BM25 找最相似的。
 
-    With ``balance`` the gold questions are drawn equally from each label, so a
-    policy cannot collect reward by always answering the majority label.
+    balance=True 时按标签等量抽题，否则模型可以靠"永远回答占多数的标签"拿到奖励。
     """
     stemmer = Stemmer.Stemmer("english")
     abstracts = [_abstract(r) for r in rows]
@@ -90,7 +86,7 @@ def build_samples(rows: list[dict], n: int, n_docs: int, p_unanswerable: float,
 
 
 def render_user(sample: dict, max_chars: int = 1500) -> str:
-    """User turn: numbered documents then the question."""
+    """用户消息：先列出编号的文档，再给出问题。"""
     docs = "\n\n".join(f"[{k}] {d[:max_chars]}" for k, d in enumerate(sample["docs"], 1))
     return f"Documents:\n{docs}\n\nQuestion: {sample['question']}"
 
@@ -103,7 +99,7 @@ def messages(sample: dict) -> list[dict]:
 
 @dataclass(slots=True)
 class Parsed:
-    """Structured view of a completion (``answer`` is None when the format is broken)."""
+    """解析后的回答（格式不对时 answer 为 None）。"""
 
     well_formed: bool
     answer: str | None
@@ -119,11 +115,11 @@ def parse(text: str) -> Parsed:
 
 
 def reward(text: str, sample: dict) -> dict[str, float]:
-    """Verifiable reward components; ``total`` = format 0.1 + answer 1.0 + citation 0.5.
+    """可自动判定的奖励：total = 格式 0.1 + 答案 1.0 + 引用 0.5。
 
-    - answerable: answer must equal the label, citation must be exactly the gold doc;
-      refusing ("insufficient") earns nothing — over-refusal is penalised implicitly.
-    - unanswerable: answer must be "insufficient" and citation "none".
+    - 可回答的题：答案要等于标签，引用必须恰好是原始摘要；回答 insufficient 拿不到答案分，
+      等于隐式惩罚了过度拒答。
+    - 不可回答的题：答案必须是 insufficient，引用必须是 none。
     """
     p = parse(text)
     r = {"format": 0.1 if p.well_formed else 0.0, "answer": 0.0, "citation": 0.0}
@@ -139,7 +135,7 @@ def reward(text: str, sample: dict) -> dict[str, float]:
 
 
 def score(texts: list[str], samples: list[dict]) -> dict[str, float]:
-    """Aggregate eval metrics over (completion, sample) pairs."""
+    """对一批（回答, 样本）计算评测指标。"""
     ans = [(parse(t), s) for t, s in zip(texts, samples)]
     a = [(p, s) for p, s in ans if s["gold"] >= 0]
     u = [(p, s) for p, s in ans if s["gold"] < 0]
@@ -160,7 +156,7 @@ def score(texts: list[str], samples: list[dict]) -> dict[str, float]:
 
 
 def main() -> None:
-    """Write ``train.jsonl`` (pqa_artificial) and ``eval.jsonl`` (pqa_labeled)."""
+    """生成 train.jsonl（来自 pqa_artificial）和 eval.jsonl（来自 pqa_labeled）。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--pubmedqa", default="data/pubmedqa")
     p.add_argument("--out", default="data/grpo")

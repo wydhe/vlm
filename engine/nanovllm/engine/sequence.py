@@ -10,15 +10,15 @@ from nanovllm.sampling_params import SamplingParams
 
 @dataclass
 class MMData:
-    """Per-request multimodal state (Qwen3-VL), computed once when the request is added."""
+    """一个请求的多模态状态（Qwen3-VL），在请求加入时计算一次。"""
 
-    embeds: torch.Tensor                # [n_image_tokens, hidden] vision features (GPU)
-    deepstack: list[torch.Tensor]       # per-LLM-layer features, same rows as ``embeds``
-    positions: torch.Tensor             # [3, prompt_len] (t, h, w) M-RoPE positions (CPU)
-    delta: int                          # later token i sits at position i + delta
-    image_hash: int                     # content hash, mixed into prefix-cache block hashes
-    first_image_pos: int                # index of the first image token
-    img_prefix: list[int]               # img_prefix[i] = #image tokens in token_ids[:i]
+    embeds: torch.Tensor                # [图像 token 数, hidden] 的视觉特征（存在 CPU 锁页内存里）
+    deepstack: list[torch.Tensor]       # 各层的 DeepStack 特征，行和 embeds 一一对应
+    positions: torch.Tensor             # [3, prompt 长度] 的 (t, h, w) M-RoPE 位置（CPU）
+    delta: int                          # prompt 之后第 i 个 token 的位置是 i + delta
+    image_hash: int                     # 图片内容哈希，会混进前缀缓存的块哈希
+    first_image_pos: int                # 第一个图像 token 的位置
+    img_prefix: list[int]               # img_prefix[i] = token_ids[:i] 里图像 token 的个数
 
 
 class SequenceStatus(Enum):

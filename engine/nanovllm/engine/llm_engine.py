@@ -117,16 +117,15 @@ class LLMEngine:
                       img_prefix=list(accumulate(is_img, initial=0)))
 
     def step_updates(self) -> tuple[list[Sequence], int]:
-        """Run one engine step.
+        """执行引擎的一步。
 
         Returns:
-            The sequences that sampled a new token in this step (partially
-            chunk-prefilled sequences are excluded), and the number of tokens
-            processed (positive for a prefill step, negative for decode).
+            这一步生成了新 token 的序列（分块 prefill 还没做完的不算），
+            以及这一步处理的 token 数（prefill 步为正数，decode 步为负数）。
         """
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        # mirrors Scheduler.postprocess: a prefill emits a token only once the whole prompt is cached
+        # 和 Scheduler.postprocess 的判断一致：prompt 全部算完后，prefill 才会产出 token
         emitted = [seq for seq in seqs
                    if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens >= seq.num_tokens]
         token_ids = self.model_runner.call("run", seqs, is_prefill)

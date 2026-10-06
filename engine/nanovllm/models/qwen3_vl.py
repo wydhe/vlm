@@ -1,16 +1,14 @@
-"""Qwen3-VL for nano-vllm: our paged-KV Qwen3 text decoder + the HF vision tower.
+"""Qwen3-VL 接入 nano-vllm：文本部分用本项目的分页 KV Qwen3 解码器，视觉部分复用 HF 的视觉编码器。
 
-Differences from text-only Qwen3, and how they map onto the engine:
+和纯文本 Qwen3 的区别，以及在引擎里的对应做法：
 
-- Vision tower (ViT + patch merger + DeepStack mergers): reused from transformers
-  and run once per request when it is added (``ModelRunner.encode_images``).
-- Image placeholder tokens: their input embeddings are replaced by vision features.
-- DeepStack: features from ViT layers (5, 11, 17) are added to the hidden states of
-  LLM layers 0..2 at image-token positions.
-- Interleaved M-RoPE: positions are (t, h, w) triples; frequency slots 1::3 / 2::3
-  (within ``3 * section``) take the h / w angle. For text tokens t == h == w, so the
-  rotation equals plain RoPE at that position: decode steps keep 1-D positions
-  (``pos + mrope_delta``) and the existing CUDA graphs.
+- 视觉编码器（ViT + patch merger + DeepStack merger）：直接复用 transformers 的实现，
+  每个请求加入时编码一次（ModelRunner.encode_images）。
+- 图像占位 token：它们的输入 embedding 换成视觉特征。
+- DeepStack：ViT 第 5、11、17 层的特征，分别加到语言模型第 0、1、2 层输出的图像 token 位置上。
+- 交错 M-RoPE：位置是 (t, h, w) 三元组；频率槽 1::3 / 2::3（前 3×section 个）取 h / w 的角度。
+  文本 token 的 t = h = w，这时旋转结果和普通 RoPE 完全一样，所以 decode 步继续用一维位置
+  （pos + mrope_delta），原有的 CUDA Graph 不用改。
 """
 
 from __future__ import annotations
@@ -26,16 +24,16 @@ from nanovllm.utils.context import get_context
 
 
 class MRotaryEmbedding(nn.Module):
-    """Interleaved multimodal RoPE over a plain RoPE cos/sin cache.
+    """在普通 RoPE 的 cos/sin 缓存之上实现交错 M-RoPE。
 
-    ``positions`` is ``[N]`` (text-only: identical to RoPE) or ``[3, N]`` (t, h, w).
+    positions 是 [N]（纯文本，和普通 RoPE 相同）或 [3, N]（t, h, w 三个分量）。
     """
 
     def __init__(self, base: RotaryEmbedding, mrope_section: list[int]):
         super().__init__()
         self.base = base
         half = base.head_size // 2
-        src = torch.zeros(half, dtype=torch.long)          # 0 = t, 1 = h, 2 = w per frequency slot
+        src = torch.zeros(half, dtype=torch.long)          # 每个频率槽取哪个分量：0 = t，1 = h，2 = w
         for dim in (1, 2):
             src[dim:mrope_section[dim] * 3:3] = dim
         self.register_buffer("src", src, persistent=False)
@@ -43,7 +41,7 @@ class MRotaryEmbedding(nn.Module):
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
         if positions.dim() == 1:
             return self.base(positions, query, key)
-        cache = self.base.cos_sin_cache                   # [max_pos, 1, 2 * half] = cat(cos, sin)
+        cache = self.base.cos_sin_cache                   # [max_pos, 1, 2 * half]，前一半是 cos，后一半是 sin
         half = cache.size(-1) // 2
         per_axis = cache[positions].squeeze(2)              # [3, N, 2 * half]
         idx = self.src.to(positions.device).view(1, 1, -1).expand(1, per_axis.size(1), -1)
@@ -54,11 +52,11 @@ class MRotaryEmbedding(nn.Module):
 
 def mrope_positions(input_ids: list[int], grid_thw: list[tuple[int, int, int]], merge: int,
                     image_token_id: int) -> tuple[torch.Tensor, int]:
-    """(t, h, w) position ids for a prompt with images (port of ``get_rope_index``, images only).
+    """计算含图片 prompt 的 (t, h, w) 位置（移植自 HF 的 get_rope_index，只处理图片）。
 
     Returns:
-        positions ``[3, L]`` (int64, CPU) and ``delta`` such that a later token at
-        sequence index ``i`` has position ``i + delta`` on all three axes.
+        positions：[3, L] 的位置（int64，CPU）；
+        delta：prompt 之后第 i 个 token 的位置是 i + delta（三个分量相同）。
     """
     parts: list[torch.Tensor] = []
     st, nxt = 0, 0
@@ -81,7 +79,7 @@ def mrope_positions(input_ids: list[int], grid_thw: list[tuple[int, int, int]], 
 
 
 class Qwen3VLForCausalLM(nn.Module):
-    """Qwen3-VL (dense) on nano-vllm. Multimodal inputs arrive through the step context."""
+    """nano-vllm 上的 Qwen3-VL（稠密版）。图像输入通过每一步的 context 传进来。"""
 
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -90,7 +88,7 @@ class Qwen3VLForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
-    # checkpoint prefix -> module prefix (applied before packed-module mapping)
+    # 权重文件里的前缀 → 本模块里的前缀（在 packed_modules_mapping 之前应用）
     hf_name_mapping = (("model.language_model.", "model."), ("model.visual.", "visual."))
 
     def __init__(self, config) -> None:
@@ -114,7 +112,7 @@ class Qwen3VLForCausalLM(nn.Module):
     @torch.inference_mode()
     def encode_images(self, pixel_values: torch.Tensor,
                       grid_thw: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Run the vision tower: merged image embeddings + per-layer DeepStack features."""
+        """跑视觉编码器：返回合并后的图像特征，以及各层的 DeepStack 特征。"""
         dtype = self.model.embed_tokens.weight.dtype
         embeds, deepstack = self.visual(pixel_values.to("cuda", dtype), grid_thw=grid_thw.to("cuda"))
         return embeds, deepstack
@@ -130,7 +128,7 @@ class Qwen3VLForCausalLM(nn.Module):
         for i, layer in enumerate(self.model.layers):
             hidden, residual = layer(positions, hidden, residual)
             if mask is not None and i < len(ctx.mm_deepstack):
-                # true hidden = hidden + residual, so adding to either term is equivalent
+                # 真正的隐状态 = hidden + residual，所以加到哪一项上都一样
                 hidden[mask] = hidden[mask] + ctx.mm_deepstack[i].to(hidden.dtype)
         hidden, _ = self.model.norm(hidden, residual)
         return hidden

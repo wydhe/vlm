@@ -1,9 +1,7 @@
-"""Offline throughput benchmark for the nano-vllm engine.
+"""nano-vllm 引擎的离线吞吐测试。
 
-Reproduces the workload of upstream ``engine/bench.py`` (seeded random prompts,
-input/output lengths uniform in [100, 1024]) so numbers are comparable with the
-upstream README, but takes the model path from CLI/env instead of a hardcoded
-path and writes a JSON record with the run environment.
+负载和上游 engine/bench.py 相同（固定种子的随机 prompt，输入和输出长度都在 [100, 1024] 均匀分布），
+可以和上游 README 的数字直接对比；模型路径改成从命令行或环境变量读取，并把结果和运行环境存成 JSON。
 
 Usage:
     MODEL_DIR=weights/Qwen3-0.6B uv run python -m bench.offline_throughput
@@ -26,7 +24,7 @@ from nanovllm import LLM, SamplingParams
 
 @dataclass
 class BenchResult:
-    """One benchmark run: workload, environment and measured throughput."""
+    """一次测试：负载、运行环境和测得的吞吐。"""
 
     model: str
     num_seqs: int
@@ -42,7 +40,7 @@ class BenchResult:
 
 
 def git_commit() -> str:
-    """Return the short HEAD commit of the repository, or ``"unknown"``."""
+    """返回仓库当前提交的短哈希，取不到时返回 "unknown"。"""
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
@@ -53,17 +51,17 @@ def git_commit() -> str:
 
 def run(model: str, num_seqs: int, max_input_len: int, max_output_len: int,
         enforce_eager: bool) -> BenchResult:
-    """Run one offline generation pass and measure output-token throughput.
+    """跑一次离线生成，测量输出 token 的吞吐。
 
     Args:
-        model: Local directory of a Hugging Face checkpoint supported by nano-vllm.
-        num_seqs: Number of requests submitted at once.
-        max_input_len: Upper bound of the random prompt length (lower bound 100).
-        max_output_len: Upper bound of the forced output length (lower bound 100).
-        enforce_eager: Disable CUDA graphs when True.
+        model: 本地模型目录（nano-vllm 支持的 Hugging Face 格式）。
+        num_seqs: 一次性提交的请求数。
+        max_input_len: 随机 prompt 长度的上限（下限 100）。
+        max_output_len: 强制输出长度的上限（下限 100）。
+        enforce_eager: 为 True 时关闭 CUDA Graph。
 
     Returns:
-        The measured ``BenchResult``.
+        测量结果 BenchResult。
     """
     seed(0)
     llm = LLM(model, enforce_eager=enforce_eager, max_model_len=4096)
@@ -97,7 +95,7 @@ def run(model: str, num_seqs: int, max_input_len: int, max_output_len: int,
 
 
 def main() -> None:
-    """Parse CLI arguments, run the benchmark and save the JSON record."""
+    """解析命令行参数，跑测试，保存 JSON 结果。"""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=os.environ.get("MODEL_DIR"),
                         help="checkpoint dir (default: $MODEL_DIR)")

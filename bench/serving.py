@@ -1,9 +1,8 @@
-"""Online serving benchmark: TTFT / TPOT / ITL / E2E latency under a request-arrival process.
+"""在线服务压测：按一定的请求到达过程发请求，统计 TTFT / TPOT / ITL / E2E 延迟。
 
-Works against any OpenAI-compatible ``/v1/completions`` endpoint that accepts
-token-id prompts, ``ignore_eos`` and ``stream_options.include_usage`` — both our
-nano-vllm server and official vLLM — so the two can be compared on identical
-requests. Prompts are sent as token ids to rule out tokenizer differences.
+适用于任何支持 token id 形式 prompt、ignore_eos 和 stream_options.include_usage 的
+OpenAI 兼容 /v1/completions 接口——本项目的服务和官方 vLLM 都支持，所以可以用完全相同的
+请求对比两者。prompt 直接发 token id，排除两边 tokenizer 不同带来的差异。
 
 Usage:
     uv run python -m bench.serving --tokenizer weights/Qwen3-8B --dataset sharegpt \
@@ -30,7 +29,7 @@ SHAREGPT_FILE = "data/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 @dataclass
 class Sample:
-    """One benchmark request."""
+    """一条压测请求。"""
 
     prompt_ids: list[int]
     output_len: int
@@ -38,14 +37,14 @@ class Sample:
 
 @dataclass
 class RequestResult:
-    """Client-side measurements of one request."""
+    """客户端测到的一条请求的数据。"""
 
     success: bool = False
     prompt_len: int = 0
-    output_len: int = 0          # completion tokens reported by the server
-    ttft: float = 0.0            # s, send -> first chunk
-    e2e: float = 0.0             # s, send -> last chunk
-    itl: list[float] = field(default_factory=list)  # s, gaps between chunks
+    output_len: int = 0          # 服务端报告的生成 token 数
+    ttft: float = 0.0            # 秒，发出请求 → 收到第一个分片
+    e2e: float = 0.0             # 秒，发出请求 → 收到最后一个分片
+    itl: list[float] = field(default_factory=list)  # 秒，相邻分片之间的间隔
     error: str = ""
 
 
@@ -53,9 +52,9 @@ class RequestResult:
 
 def sample_sharegpt(path: str, n: int, tokenizer: PreTrainedTokenizerBase, rng: random.Random,
                     max_prompt_len: int = 1024, max_total_len: int = 2048) -> list[Sample]:
-    """First human turn as prompt, first model reply's length as output length.
+    """取对话中用户的第一句作为 prompt，模型第一次回复的长度作为输出长度。
 
-    Filtering follows vLLM's ``benchmark_serving`` defaults so results are comparable.
+    过滤规则和 vLLM 的 benchmark_serving 默认值一致，方便和别人的结果比较。
     """
     with open(path) as f:
         convs = [d["conversations"] for d in json.load(f) if len(d.get("conversations", [])) >= 2]
@@ -78,7 +77,7 @@ def sample_sharegpt(path: str, n: int, tokenizer: PreTrainedTokenizerBase, rng: 
 
 def sample_random(n: int, input_len: int, output_len: int, rng: random.Random,
                   range_ratio: float = 0.0) -> list[Sample]:
-    """Random token ids; lengths uniform in [len * (1 - ratio), len]."""
+    """随机 token id；长度在 [len × (1 - ratio), len] 之间均匀分布。"""
     def draw(length: int) -> int:
         return rng.randint(max(1, int(length * (1 - range_ratio))), length)
     return [Sample([rng.randint(1000, 20000) for _ in range(draw(input_len))], draw(output_len))
@@ -89,7 +88,7 @@ def sample_random(n: int, input_len: int, output_len: int, rng: random.Random,
 
 async def send(session: aiohttp.ClientSession, url: str, model: str, sample: Sample,
                temperature: float) -> RequestResult:
-    """Send one streaming completion request and time every chunk."""
+    """发一个流式请求，记录每个分片到达的时间。"""
     payload = {"model": model, "prompt": sample.prompt_ids, "max_tokens": sample.output_len,
                "temperature": temperature, "ignore_eos": True, "stream": True,
                "stream_options": {"include_usage": True}}
@@ -132,15 +131,15 @@ async def send(session: aiohttp.ClientSession, url: str, model: str, sample: Sam
 async def run_load(base_url: str, model: str, samples: list[Sample], request_rate: float,
                    max_concurrency: int | None, temperature: float, seed: int
                    ) -> tuple[list[RequestResult], float]:
-    """Issue requests with Poisson inter-arrival times (``inf`` = all at once)."""
+    """按泊松过程的间隔发请求（速率为 inf 时一次性全部发出）。"""
     url = base_url.rstrip("/") + "/v1/completions"
     rng = random.Random(seed)
     sem = asyncio.Semaphore(max_concurrency) if max_concurrency else None
     timeout = aiohttp.ClientTimeout(total=6 * 3600)
     async with aiohttp.ClientSession(timeout=timeout,
                                      connector=aiohttp.TCPConnector(limit=0)) as session:
-        # warmup: a concurrent burst so one-off JIT work (e.g. torch.compile recompiling
-        # for new batch shapes) happens before the timed run, not inside its P99
+        # 预热：先并发发一批请求，让一次性的 JIT 编译（例如 torch.compile 遇到新的批大小时重新编译）
+        # 发生在正式计时之前，不要落进 P99
         await asyncio.gather(*(send(session, url, model, Sample(s.prompt_ids[:64], 16), temperature)
                                for s in samples[:16]))
 
@@ -171,7 +170,7 @@ def _stats(values: list[float], scale: float = 1000.0) -> dict[str, float]:
 
 
 def summarize(results: list[RequestResult], duration: float) -> dict:
-    """Aggregate per-request results; latencies in ms."""
+    """汇总所有请求的结果，延迟单位是毫秒。"""
     ok = [r for r in results if r.success]
     out_tokens = sum(r.output_len for r in ok)
     in_tokens = sum(r.prompt_len for r in ok)
@@ -194,7 +193,7 @@ def summarize(results: list[RequestResult], duration: float) -> dict:
 
 
 def print_summary(s: dict) -> None:
-    """Print a compact human-readable table."""
+    """打印一张简洁的结果表。"""
     print(f"completed {s['completed']}  failed {s['failed']}  duration {s['duration_s']:.1f}s")
     print(f"req/s {s['request_throughput']:.2f}   out tok/s {s['output_throughput']:.1f}   "
           f"total tok/s {s['total_token_throughput']:.1f}")
@@ -207,7 +206,7 @@ def print_summary(s: dict) -> None:
 
 
 def main() -> None:
-    """Parse CLI arguments, run the load and save a JSON record."""
+    """解析命令行参数，跑压测，保存 JSON 结果。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--model", default=None, help="model field sent to the server (default: tokenizer dir name)")
