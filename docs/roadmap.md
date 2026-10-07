@@ -52,5 +52,6 @@
 | 5 | PubMed 全量语料 | ✅ `p10_pubmed_rag.md` |
 | 6 | 中文医学评测 | ✅（负面结果）`p11_chinese_rag.md` |
 | 7 | 推送 GitHub、技术博客 | 博客草稿 `blog_engine_profiling.md` |
+| 补充 | PubMed 语料下的闭环评测与 Agent | ✅ `p12_pubmed_followups.md` |
 
 P4 Radix Tree、P7 Qwen3.5 未做，原因见总报告 §6、§10。

@@ -40,6 +40,7 @@
 | 医疗混合检索 RAG、Agentic RAG | ✅ | `p5_rag_agent.md` |
 | PubMed 全量语料（2390 万条）两阶段检索 | ✅ | `p10_pubmed_rag.md` |
 | 中文医学检索与考试题评测 | ✅（负面结果） | `p11_chinese_rag.md` |
+| PubMed 语料下重做闭环评测与 Agent | ✅ | `p12_pubmed_followups.md` |
 | GRPO 对齐（引用 + 拒答），3 个随机种子 | ✅ | `p6_grpo.md`、`p8_robustness.md` |
 | 闭环：GRPO 模型部署回检索流程 | ✅ | `p7_closed_loop.md`、`p8_robustness.md` |
 | 压测重复实验（上游 / 本项目 / vLLM × 3 档负载 × 3 次） | ✅ | `p8_robustness.md` |
@@ -89,12 +90,15 @@
 |---|---|---|---|---|
 | MIRAGE 5 个数据集（4,118 题） | MedRAG 教材 | **0.669** | 0.610 | 语料覆盖不到 PubMedQA / BioASQ |
 | PubMedQA（500）/ BioASQ（618） | 教材 | 0.558 / 0.794 | 0.420 / 0.660 | 下降 |
-| PubMedQA / BioASQ | **PubMed（2390 万条）** | 0.558 / 0.794 | **0.734 / 0.871** | 上升；Recall@5 0.97 / 0.72 |
+| PubMedQA / BioASQ | **PubMed（2390 万条）** | 0.558 / 0.794 | 0.734† / **0.871** | 上升；Recall@5 0.97 / 0.72 |
 | MCMLE（3,426）/ CMB（280） | 华佗百科（中文） | **0.851 / 0.689** | 0.830 / 0.632 | 下降：百科问答覆盖不到考试知识 |
 
-- **核心结论：RAG 有没有用取决于语料能否覆盖问题**。同一套检索流程，换对语料后 PubMedQA / BioASQ 的平均变化从 −13.6 变成 +12.6 个点。
-  PubMedQA 的题目由原文标题改写、原文也在语料里（召回 0.97），提升偏大；BioASQ 的 +7.7 个点更有代表性。
-- Agentic RAG（教材语料，同一批 1,000 题）：0.683，比强制单次检索（0.627）高 5.6 个点，但仍低于不检索（0.729）；前缀缓存命中率 21%。
+† PubMedQA 不给摘要的结论段，而 PubMed 语料收的是完整摘要：96% 的检索结果包含原文结论，等于泄漏了答案，这个数字不能当作检索收益。
+
+- **核心结论：RAG 有没有用取决于语料能否覆盖问题**。干净的证据是 BioASQ：教材检索 −13.4 个点，PubMed 检索 +7.7 个点。
+- Agentic RAG（Qwen3-8B，同一批 1,000 题）：教材语料 0.683，低于不检索（0.729）；**PubMed 语料 0.738，略高于不检索**（+0.9 个点，不显著），
+  BioASQ +5.5 个点。工具描述换成"检索科研文献"后，模型在 MMLU 上的检索次数减少了 40%。
+  注意：这 1,000 题是每个数据集的前 200 题，PubMedQA 的前 200 题全部是 yes，这一列有偏。
 
 ### 3.4 GRPO 对齐与闭环（Qwen3-1.7B，150 步，单卡约 36 分钟 / 种子）
 
@@ -115,7 +119,16 @@
 | 资料不足时闭卷兜底 | 0.504 | **0.653 ± 0.005** |
 | 引用准确率 | 0.650 | **0.913 ± 0.025** |
 
+换成 PubMed 检索（`p12_pubmed_followups.md`）：
+
+| 条件 | 原始模型 | GRPO（3 个种子） |
+|---|---|---|
+| BioASQ，只用资料 | 0.542 | **0.818 ± 0.016** |
+| BioASQ，资料不足时闭卷兜底 | 0.706 | **0.846 ± 0.011**（Qwen3-8B 检索后为 0.871） |
+| PubMedQA，原始摘要 + 3 篇相似 PubMed 摘要，引用准确率 | 0.314 | **0.604 ± 0.026** |
+
 - 有据作答的提升在三个种子上非常稳定。闭卷准确率也上升了（0.298 → 0.393 ± 0.043），但主要来自"少答 maybe"这一副作用。
+- 1.7B 的 GRPO 模型配合 PubMed 检索，在 BioASQ 上接近 8B 模型检索后的水平，并且超过 8B 闭卷（0.794）。
 - 新偏差：训练集按 yes/no 1:1 平衡，模型回答 "no" 的比例高于真实分布。
 
 ## 4. 关键工程问题与定位过程（面试素材）
@@ -141,7 +154,8 @@
 ## 5. 负面结果与局限
 
 - 中低负载下 ITL P99 仍落后 vLLM（35 vs 23 ms）。
-- 教材语料和中文百科语料下，检索都降低了准确率；Agent 也没有超过不检索。
+- 教材语料和中文百科语料下，检索都降低了准确率；Agent 只在 PubMed 语料下略微超过不检索，且不显著。
+- PubMedQA 的 PubMed 检索存在答案泄漏（结论段）；Agent 评测按"前 200 题"抽样，PubMedQA 子集全部是 yes。两者都应改进后重测。
 - GRPO：留出集同时用于挑选最好检查点；训练集没有 maybe 类；引入了偏向 "no" 的新偏差。
 - Qwen3-VL：含图片的 prefill 走 eager，是当前端到端瓶颈；不支持视频与多卡。
 - P99 类指标在 500 条样本上只对应 5 个请求，8 req/s 时波动很大（标准差 17~22 ms），不适合写成精确数字。
@@ -176,6 +190,7 @@ uv run python -m rag.eval_mirage --max-per-dataset 1000    # 需先启动上面�
 uv run python -m rag.pubmed build --shards 24 --workers 12
 uv run python -m rag.chinese
 bash scripts/run_rag_evals.sh                              # PubMed + 中文评测
+bash scripts/run_pubmed_followups.sh                       # PubMed 语料下的闭环评测与 Agent
 # GRPO 与闭环
 uv run python -m align.task && uv run python -m align.grpo --seed 0 --label seed0
 uv run python -m align.summarize_seeds --runs results/grpo/seed0 results/grpo/seed1 results/grpo/seed2
@@ -197,9 +212,9 @@ uv run pytest tests
   Qwen3-8B 在 16 req/s 下 **ITL P99 降低 86%（248 → 35 ms）、TPOT 降低 58%**（3 次重复）。
 - 为引擎接入 Qwen3-VL（交错 M-RoPE、DeepStack、批量视觉编码、OpenAI 图片输入），发现并修复多模态前缀缓存的跨图片 KV 误复用。
 - 搭建医疗检索：MedCPT / BM25 / RRF / 重排；为 2390 万条 PubMed 语料设计分片 BM25 + 两阶段检索（8 分钟建完索引），
-  BioASQ 准确率 0.794 → 0.871；系统评估并如实报告了语料不匹配时检索有害的负面结果。
+  BioASQ 准确率 0.794 → 0.871；系统评估并如实报告了语料不匹配时检索有害、以及 PubMedQA 检索存在答案泄漏的问题。
 - 手写 GRPO 训练器，用自研引擎做同卡 rollout 并原地同步权重（处理前缀缓存导致的隐性 off-policy）；
-  3 个种子下引用准确率 0.71 → 0.92，部署回检索流程后有据作答准确率 0.43 → 0.63。
+  3 个种子下引用准确率 0.71 → 0.92；部署回 PubMed 检索流程后，1.7B 模型在 BioASQ 上从 0.706 提升到 0.846。
 
 ## 9. 面试可能追问
 
@@ -210,12 +225,12 @@ uv run pytest tests
 - 前缀缓存为什么按块、为什么用链式哈希？多模态为什么必须混入图片哈希？
 - GRPO 与 PPO / DPO 的区别；组内奖励全相同为什么没有梯度；每批只更新一次时 clip 为什么不生效；k3 KL 估计的性质。
 - RL 里 rollout 引擎和训练权重如何保持一致？前缀缓存为什么会导致 off-policy？
-- 为什么同一套检索在教材 / 百科语料上有害、在 PubMed 上有效？PubMedQA 的提升为什么要打折看？
+- 为什么同一套检索在教材 / 百科语料上有害、在 PubMed 上有效？PubMedQA 的检索结果为什么会泄漏答案，你是怎么发现的？
 
 ## 10. 后续工作
 
 1. 含图片的 prefill 步支持三维位置的分段 CUDA Graph（当前多模态端到端的瓶颈）。
 2. 中低负载下的 ITL P99（与 vLLM 差 12 ms）：分析尾部请求的调度时序。
-3. 中文教材 / 临床指南语料；用 GRPO 训练 Agent 的"何时检索"。
+3. 中文教材 / 临床指南语料；用 GRPO 训练 Agent 的"何时检索"；Agent 评测改为随机抽样，PubMedQA 检索时去掉原文结论段。
 4. GRPO：用独立验证集挑选检查点，加入 maybe 类数据，修正 yes/no 先验偏差。
 5. Qwen3.5 混合注意力（分页 KV 与 DeltaNet 递归状态共存）。
