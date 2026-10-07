@@ -1,8 +1,8 @@
 """有据作答 + 闭卷兜底：把 GRPO 对齐后的模型接回推理服务，放进检索流程里评测。
 
 每道题的流程：
-    1. 检索：从医学教材库取 top-k 片段；对 PubMedQA 还可以把题目对应的原始摘要混进去，
-       模拟"检索到了正确文献"的情况。
+    1. 检索：从语料（教材或 PubMed）取 top-k 文档；对 PubMedQA 另外构造一组"原始摘要 + 检索到的
+       其他文档"，模拟"一定检索到了正确文献"的情况（检索结果里的原文按 PMID 去掉，避免重复）。
     2. 有据作答：按 GRPO 训练时的格式，让模型引用某篇文档作答，或回答 insufficient（资料不足）。
     3. 闭卷兜底：如果模型认为资料不足，就不给资料，让它直接作答。
 
@@ -13,6 +13,9 @@
 
 用法（先用 openai_server 启动要评测的模型）：
     uv run python -m agent.grounded_qa --model Qwen3-1.7B-GRPO --label grpo
+    uv run python -m agent.grounded_qa --model Qwen3-1.7B-GRPO --corpus pubmed --label grpo-pubmed
+
+同一语料、k、seed 的检索结果缓存在 results/grounded/docs-<语料>-k<k>-seed<seed>.json，换模型时直接复用。
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ import pyarrow.parquet as pq
 
 from align.task import SYSTEM as GROUNDED_SYSTEM
 from align.task import parse, render_user
-from rag.retrievers import HybridRetriever
+from rag.search import CORPORA, load_search
 
 CLOSED_SYSTEM = (
     "You answer biomedical yes/no questions.\n"
@@ -59,6 +62,7 @@ def load_questions(mirage_path: str, pubmedqa_dir: str) -> list[dict]:
                 "qid": qid,
                 "question": q["question"],
                 "label": q["options"][q["answer"]],
+                "pmids": [str(pmid) for pmid in q["PMID"]],
             }
             if dataset == "pubmedqa":
                 item["gold_abstract"] = abstracts[str(q["PMID"][0])]
@@ -66,18 +70,34 @@ def load_questions(mirage_path: str, pubmedqa_dir: str) -> list[dict]:
     return questions
 
 
-def attach_documents(questions: list[dict], retriever: HybridRetriever, k: int, seed: int) -> None:
-    """为每道题准备两组文档：纯教材检索结果，和"原始摘要 + 教材检索结果"（仅 PubMedQA）。"""
-    rng = random.Random(seed)
-    hits = retriever.search([q["question"] for q in questions], k=k, mode="hybrid_rerank")
-    for q, hit_list in zip(questions, hits):
-        textbook_docs = [h.content for h in hit_list]
-        q["docs_textbook"] = textbook_docs
-        if "gold_abstract" in q:
-            docs = [q["gold_abstract"]] + textbook_docs[:k - 1]
-            rng.shuffle(docs)
-            q["docs_gold"] = docs
-            q["gold_index"] = docs.index(q["gold_abstract"])
+def attach_documents(questions: list[dict], corpus: str, k: int, seed: int, cache_dir: Path,
+                     models: tuple[str, str, str]) -> None:
+    """为每道题准备两组文档：检索结果（docs_retrieved），和"原始摘要 + 检索结果"（docs_gold，仅 PubMedQA）。"""
+    cache_file = cache_dir / f"docs-{corpus}-k{k}-seed{seed}.json"
+    if cache_file.exists():
+        cached = json.loads(cache_file.read_text())
+    else:
+        search = load_search(corpus, *models)
+        # 多取一条：PubMedQA 的原文可能在检索结果里，去掉后仍有 k-1 篇干扰文档
+        hits = search([q["question"] for q in questions], k + 1)
+        rng = random.Random(seed)
+        cached = {}
+        for q, hit_list in zip(questions, hits):
+            entry = {"retrieved": [h["content"] for h in hit_list[:k]]}
+            if "gold_abstract" in q:
+                others = [h["content"] for h in hit_list if str(h["id"]) not in q["pmids"]]
+                docs = [q["gold_abstract"]] + others[:k - 1]
+                rng.shuffle(docs)
+                entry["gold"] = docs
+            cached[f"{q['dataset']}/{q['qid']}"] = entry
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(cached))
+    for q in questions:
+        entry = cached[f"{q['dataset']}/{q['qid']}"]
+        q["docs_retrieved"] = entry["retrieved"]
+        if "gold" in entry:
+            q["docs_gold"] = entry["gold"]
+            q["gold_index"] = entry["gold"].index(q["gold_abstract"])
 
 
 # ----------------------------------------------------------------------------- 调用模型
@@ -116,7 +136,7 @@ async def evaluate_one(session, url, model, q, sem) -> dict:
     """对一道题跑完所有条件，返回逐题记录。"""
     record = {"dataset": q["dataset"], "qid": q["qid"], "label": q["label"]}
     record["closed"] = await answer_closed(session, url, model, q, sem)
-    record["textbook"] = await answer_grounded(session, url, model, q, q["docs_textbook"], sem)
+    record["retrieved"] = await answer_grounded(session, url, model, q, q["docs_retrieved"], sem)
     if "docs_gold" in q:
         record["gold"] = await answer_grounded(session, url, model, q, q["docs_gold"], sem)
         record["gold_index"] = q["gold_index"]
@@ -146,7 +166,7 @@ def summarize(records: list[dict]) -> dict:
     summary = {}
     for dataset in ("pubmedqa", "bioasq"):
         rows = [r for r in records if r["dataset"] == dataset]
-        doc_conditions = ["textbook", "gold"] if dataset == "pubmedqa" else ["textbook"]
+        doc_conditions = ["retrieved", "gold"] if dataset == "pubmedqa" else ["retrieved"]
         for docs_key in doc_conditions:
             name = f"{dataset}/{docs_key}"
             correct = {"closed": 0, "rag": 0, "rag+fb": 0}
@@ -171,9 +191,9 @@ def main() -> None:
     p.add_argument("--model", required=True, help="服务端的模型名")
     p.add_argument("--mirage", default="data/mirage/benchmark.json")
     p.add_argument("--pubmedqa", default="data/pubmedqa")
-    p.add_argument("--corpus", default="data/medrag/textbooks/chunk")
-    p.add_argument("--index", default="data/indexes/textbooks")
+    p.add_argument("--corpus", choices=CORPORA, default="textbooks", help="检索哪个语料")
     p.add_argument("--query-model", default="weights/MedCPT-Query-Encoder")
+    p.add_argument("--article-model", default="weights/MedCPT-Article-Encoder")
     p.add_argument("--reranker-model", default="weights/MedCPT-Cross-Encoder")
     p.add_argument("--k", type=int, default=4, help="每题给模型的文档数")
     p.add_argument("--concurrency", type=int, default=64)
@@ -183,8 +203,8 @@ def main() -> None:
     args = p.parse_args()
 
     questions = load_questions(args.mirage, args.pubmedqa)
-    retriever = HybridRetriever.from_index(args.corpus, args.index, args.query_model, args.reranker_model)
-    attach_documents(questions, retriever, args.k, args.seed)
+    attach_documents(questions, args.corpus, args.k, args.seed, Path(args.out_dir),
+                     (args.query_model, args.article_model, args.reranker_model))
     print(f"{len(questions)} 道题，开始评测模型 {args.model}")
 
     records = asyncio.run(evaluate_all(args.base_url, args.model, questions, args.concurrency))

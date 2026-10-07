@@ -12,6 +12,7 @@
 用法：
     uv run python -m agent.medical_agent --per-dataset 200 --label agent-qwen3-8b \
         --compare results/rag/qwen3-8b-textbooks-k5.json
+    uv run python -m agent.medical_agent --per-dataset 200 --corpus pubmed --label agent-qwen3-8b-pubmed
 """
 
 from __future__ import annotations
@@ -28,14 +29,13 @@ from pathlib import Path
 import aiohttp
 
 from rag.eval_mirage import accuracy, load_mirage, parse_letter
-from rag.retrievers import HybridRetriever
+from rag.search import CORPORA, SearchFn, load_search
 
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "search_medical_kb",
-        "description": "Search medical textbooks (anatomy, physiology, pathology, pharmacology, "
-                       "internal medicine, ...) and return the most relevant passages.",
+        "description": "",   # 按语料填写，见 TOOL_DESCRIPTIONS
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string",
@@ -44,6 +44,12 @@ TOOLS = [{
         },
     },
 }]
+TOOL_DESCRIPTIONS = {
+    "textbooks": "Search medical textbooks (anatomy, physiology, pathology, pharmacology, "
+                 "internal medicine, ...) and return the most relevant passages.",
+    "pubmed": "Search PubMed abstracts of biomedical research articles and return the most "
+              "relevant ones.",
+}
 SYSTEM = ("You are a medical expert answering a multiple-choice question. You may call "
           "search_medical_kb (at most {max_calls} times) to look up facts you are unsure about. "
           "When you are confident, reply with 'Answer: <letter>' and nothing else.")
@@ -54,16 +60,16 @@ FINAL = re.compile(r"Answer:\s*\(?([A-E])\b")
 class LockedRetriever:
     """很多题同时在跑，检索模型在 GPU 上，用一把锁让检索一次只做一个。"""
 
-    def __init__(self, retriever: HybridRetriever, k: int, max_chars: int):
-        self.retriever = retriever
+    def __init__(self, search: SearchFn, k: int, max_chars: int):
+        self.search = search
         self.k = k
         self.max_chars = max_chars
         self.lock = threading.Lock()
 
     def __call__(self, query: str) -> str:
         with self.lock:
-            hits = self.retriever.search([query], k=self.k, mode="hybrid_rerank")[0]
-        return "\n".join(f"[{i}] ({h.title}) {h.content[:self.max_chars]}"
+            hits = self.search([query], self.k)[0]
+        return "\n".join(f"[{i}] ({h['title']}) {h['content'][:self.max_chars]}"
                          for i, h in enumerate(hits, 1))
 
 
@@ -215,9 +221,9 @@ def main() -> None:
     p.add_argument("--k", type=int, default=3, help="每次检索返回几段")
     p.add_argument("--max-chars", type=int, default=1200)
     p.add_argument("--concurrency", type=int, default=64)
-    p.add_argument("--corpus", default="data/medrag/textbooks/chunk")
-    p.add_argument("--index", default="data/indexes/textbooks")
+    p.add_argument("--corpus", choices=CORPORA, default="textbooks", help="检索哪个语料")
     p.add_argument("--query-model", default="weights/MedCPT-Query-Encoder")
+    p.add_argument("--article-model", default="weights/MedCPT-Article-Encoder")
     p.add_argument("--reranker-model", default="weights/MedCPT-Cross-Encoder")
     p.add_argument("--compare", default=None, help="rag.eval_mirage 的结果文件，用于同题对比")
     p.add_argument("--label", default="agent")
@@ -226,8 +232,9 @@ def main() -> None:
 
     questions = select_questions(args.mirage, args.datasets, args.per_dataset)
     print(f"{len(questions)} 道题")
-    retriever = HybridRetriever.from_index(args.corpus, args.index, args.query_model, args.reranker_model)
-    search = LockedRetriever(retriever, args.k, args.max_chars)
+    TOOLS[0]["function"]["description"] = TOOL_DESCRIPTIONS[args.corpus]
+    search = LockedRetriever(load_search(args.corpus, args.query_model, args.article_model, args.reranker_model),
+                             args.k, args.max_chars)
 
     before = asyncio.run(get_metrics(args.base_url))
     start = time.perf_counter()
